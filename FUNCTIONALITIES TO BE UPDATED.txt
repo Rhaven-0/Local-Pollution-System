@@ -1,0 +1,24 @@
+FUNCTIONALITIES TO BE UPDATED
+
+ADMIN DASHBOARD:
+Live Recent Report Submissions
+Review button must have Reject report
+Validation Checklist should not have to be clicked one by one to submit the validated report
+Validation checklist should become Rejection Checklist and the list are reasons for rejection -> when reject button is clicked the ticked checklist are reasons for rejection.
+
+All pollutions Report:
+Under the Review button remove the validate report + modal
+Under the update button, remove approve and reject since Live report already has these options(redundancy)
+
+USER DASHBOARD:
+Change/Remove this "Track pollution reports, stay informed about incidents in your area, and contribute to a cleaner environment."
+Nearby Pollution Incidents
+Add option to reply/comment on the forums as well as like
+Nearby Pollution Incidents Remove should also be in ajax since no real time update
+Users can report other community reports
+
+
+OVERALL
+Expound more on under investigation and resolved.
+
+IMPROVE UI
