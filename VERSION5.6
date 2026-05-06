@@ -1,0 +1,4215 @@
+<?php
+// =============================================
+// config.php — Database Connection
+// =============================================
+
+// Start session with enhanced security
+ini_set('session.cookie_httponly', 1);
+ini_set('session.use_only_cookies', 1);
+ini_set('session.cookie_secure', 0); // Set to 1 if using HTTPS
+
+session_start();
+
+// Regenerate session ID on each page load to prevent session fixation
+if (!isset($_SESSION['initiated'])) {
+    session_regenerate_id(true);
+    $_SESSION['initiated'] = true;
+}
+
+$host   = "localhost";
+$dbname = "pollution_app";
+$user   = "root";
+$pass   = "";
+
+try {
+    $conn = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $user, $pass);
+    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    die("Connection failed: " . $e->getMessage());
+}
+
+// ---- Security Helper Functions ----
+
+function isLoggedIn() {
+    return isset($_SESSION['user_id']) && 
+           isset($_SESSION['user_agent']) && 
+           isset($_SESSION['user_ip']) &&
+           isset($_SESSION['login_token']) &&
+           validateSession();
+}
+
+function validateSession() {
+    // Validate user agent hasn't changed (prevents session hijacking)
+    if (!isset($_SESSION['user_agent']) || $_SESSION['user_agent'] !== $_SERVER['HTTP_USER_AGENT']) {
+        destroySession();
+        return false;
+    }
+    
+    // Validate IP hasn't changed (prevents session hijacking from different location)
+    if (!isset($_SESSION['user_ip']) || $_SESSION['user_ip'] !== $_SERVER['REMOTE_ADDR']) {
+        destroySession();
+        return false;
+    }
+    
+    // Validate login token exists and matches
+    if (!isset($_SESSION['login_token']) || !isset($_SESSION['login_token_time'])) {
+        destroySession();
+        return false;
+    }
+    
+    // Check if session has expired (30 minutes of inactivity)
+    if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity'] > 1800)) {
+        destroySession();
+        return false;
+    }
+    
+    // Update last activity time
+    $_SESSION['last_activity'] = time();
+    
+    return true;
+}
+
+function destroySession() {
+    $_SESSION = array();
+    if (isset($_COOKIE[session_name()])) {
+        setcookie(session_name(), '', time() - 3600, '/');
+    }
+    session_destroy();
+}
+
+function isAdmin() {
+    return isLoggedIn() && isset($_SESSION['role']) && $_SESSION['role'] === 'admin';
+}
+
+function redirectIfNotLoggedIn() {
+    if (!isLoggedIn()) {
+        header("Location: login.php?error=session_expired");
+        exit();
+    }
+}
+
+function redirectIfNotAdmin() {
+    if (!isLoggedIn()) {
+        header("Location: login.php?error=session_expired");
+        exit();
+    }
+    if (!isAdmin()) {
+        header("Location: userDashboard.php");
+        exit();
+    }
+}
+
+// Prevent access to authenticated pages if already logged in
+function redirectIfLoggedIn() {
+    if (isLoggedIn()) {
+        if (isAdmin()) {
+            header("Location: adminDashboard.php");
+        } else {
+            header("Location: userDashboard.php");
+        }
+        exit();
+    }
+}
+
+// Generate a unique login token
+function generateLoginToken() {
+    return bin2hex(random_bytes(32));
+}
+?>
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+
+header('Content-Type: application/json');
+
+$user_id = $_SESSION['user_id'];
+
+// Recent reports (last 5)
+$stmt = $conn->prepare("SELECT * FROM reports WHERE user_id = :uid ORDER BY created_at DESC LIMIT 5");
+$stmt->execute([':uid' => $user_id]);
+$recent_reports = $stmt->fetchAll();
+
+// Nearby incidents (last 10 approved with location)
+$stmt = $conn->prepare("
+    SELECT r.*, u.username,
+    (SELECT COUNT(*) FROM report_supports WHERE report_id = r.id AND user_id = :uid) as user_supported
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.status = 'approved' AND r.latitude IS NOT NULL AND r.longitude IS NOT NULL
+    ORDER BY r.created_at DESC
+    LIMIT 10
+");
+$stmt->execute([':uid' => $user_id]);
+$nearby_incidents = $stmt->fetchAll();
+
+// Unread notifications count
+$stmt = $conn->prepare("SELECT COUNT(*) FROM notifications WHERE user_id = :uid AND is_read = 0");
+$stmt->execute([':uid' => $user_id]);
+$unread_count = $stmt->fetchColumn();
+
+// Stats
+$stmt = $conn->prepare("
+    SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'under_investigation' THEN 1 ELSE 0 END) as investigating,
+        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved
+    FROM reports WHERE user_id = :uid
+");
+$stmt->execute([':uid' => $user_id]);
+$stats = $stmt->fetch();
+
+echo json_encode([
+    'success' => true,
+    'recent_reports' => $recent_reports,
+    'nearby_incidents' => $nearby_incidents,
+    'unread_count' => (int)$unread_count,
+    'stats' => $stats,
+    'timestamp' => time()
+]);
+?>
+
+-- =============================================
+-- Local Pollution Reporting App - Database
+-- =============================================
+
+CREATE DATABASE IF NOT EXISTS pollution_app;
+USE pollution_app;
+
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    username    VARCHAR(50)  NOT NULL UNIQUE,
+    email       VARCHAR(100) NOT NULL UNIQUE,
+    password    VARCHAR(255) NOT NULL,
+    role        ENUM('user','admin') DEFAULT 'user',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Reports table
+CREATE TABLE IF NOT EXISTS reports (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    title       VARCHAR(150) NOT NULL,
+    description TEXT,
+    photo       VARCHAR(255),
+    latitude    DECIMAL(10,7),
+    longitude   DECIMAL(10,7),
+    location    VARCHAR(200),
+    status      ENUM('pending','approved','rejected') DEFAULT 'pending',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Forum posts table
+CREATE TABLE IF NOT EXISTS posts (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Insert default admin account (password: admin123)
+INSERT INTO users (username, email, password, role)
+VALUES ('admin', 'admin@pollutionapp.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'admin');
+
+-- =============================================
+-- Local Pollution Reporting App - COMPLETE DATABASE
+-- =============================================
+
+CREATE DATABASE IF NOT EXISTS pollution_app;
+USE pollution_app;
+
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    username    VARCHAR(50)  NOT NULL UNIQUE,
+    email       VARCHAR(100) NOT NULL UNIQUE,
+    password    VARCHAR(255) NOT NULL,
+    role        ENUM('user','admin') DEFAULT 'user',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Reports table (UPDATED with all fields from PDF)
+CREATE TABLE IF NOT EXISTS reports (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    user_id          INT NOT NULL,
+    title            VARCHAR(150) NOT NULL,
+    pollution_type   ENUM('Air','Water','Noise','Waste','Chemical','Soil','Other') NOT NULL,
+    severity_level   ENUM('Low','Medium','High') NOT NULL,
+    description      TEXT,
+    photo            VARCHAR(255),
+    latitude         DECIMAL(10,7),
+    longitude        DECIMAL(10,7),
+    location         VARCHAR(200),
+    status           ENUM('pending','under_investigation','action_taken','resolved','rejected','approved') DEFAULT 'pending',
+    admin_notes      TEXT,
+    is_verified      TINYINT(1) DEFAULT 0,
+    verified_at      TIMESTAMP NULL,
+    verified_by      INT NULL,
+    support_count    INT DEFAULT 0,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (verified_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Community Support/Upvote table
+CREATE TABLE IF NOT EXISTS report_supports (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    report_id   INT NOT NULL,
+    user_id     INT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_support (report_id, user_id),
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Forum posts table
+CREATE TABLE IF NOT EXISTS posts (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Admin activity logs
+CREATE TABLE IF NOT EXISTS admin_logs (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    admin_id    INT NOT NULL,
+    report_id   INT NULL,
+    action      VARCHAR(100) NOT NULL,
+    old_status  VARCHAR(50) NULL,
+    new_status  VARCHAR(50) NULL,
+    notes       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE
+);
+
+-- Validation checklist
+CREATE TABLE IF NOT EXISTS validation_checklist (
+    id                      INT AUTO_INCREMENT PRIMARY KEY,
+    report_id               INT NOT NULL,
+    admin_id                INT NOT NULL,
+    photo_attached          TINYINT(1) DEFAULT 0,
+    location_valid          TINYINT(1) DEFAULT 0,
+    description_adequate    TINYINT(1) DEFAULT 0,
+    severity_appropriate    TINYINT(1) DEFAULT 0,
+    no_duplicates           TINYINT(1) DEFAULT 0,
+    overall_valid           TINYINT(1) DEFAULT 0,
+    validation_notes        TEXT,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE,
+    FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Notifications table
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    report_id   INT NULL,
+    type        ENUM('new_report','status_update','admin_action','support_received','high_severity_alert') NOT NULL,
+    title       VARCHAR(200) NOT NULL,
+    message     TEXT NOT NULL,
+    is_read     TINYINT(1) DEFAULT 0,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE
+);
+
+-- To create the admin account, run create_admin.php in your browser after importing this SQL.
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+redirectIfNotAdmin();
+
+// Fetch all reports
+$stmt = $conn->prepare("
+    SELECT 
+        r.id,
+        r.title,
+        r.pollution_type,
+        r.severity_level,
+        r.location,
+        r.status,
+        r.support_count,
+        r.is_verified,
+        r.created_at,
+        u.username as submitted_by
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    ORDER BY r.created_at DESC
+");
+$stmt->execute();
+$reports = $stmt->fetchAll();
+
+// Set headers for CSV download
+header('Content-Type: text/csv; charset=utf-8');
+header('Content-Disposition: attachment; filename=pollution_reports_' . date('Y-m-d') . '.csv');
+
+// Create output stream
+$output = fopen('php://output', 'w');
+
+// Add BOM for Excel UTF-8 support
+fprintf($output, chr(0xEF).chr(0xBB).chr(0xBF));
+
+// Write headers
+fputcsv($output, [
+    'ID',
+    'Title',
+    'Pollution Type',
+    'Severity',
+    'Location',
+    'Status',
+    'Support Count',
+    'Verified',
+    'Submitted By',
+    'Created At'
+]);
+
+// Write data
+foreach ($reports as $r) {
+    fputcsv($output, [
+        $r['id'],
+        $r['title'],
+        $r['pollution_type'],
+        $r['severity_level'],
+        $r['location'],
+        $r['status'],
+        $r['support_count'],
+        $r['is_verified'] ? 'Yes' : 'No',
+        $r['submitted_by'],
+        $r['created_at']
+    ]);
+}
+
+fclose($output);
+exit();
+?>
+
+<?php
+require 'config.php';
+
+// Redirect if already logged in
+redirectIfLoggedIn();
+
+$error = "";
+
+if (isset($_POST['login'])) {
+    $email    = trim($_POST['email']);
+    $password = trim($_POST['password']);
+
+    if (empty($email) || empty($password)) {
+        $error = "Please fill in all fields.";
+    } else {
+        $stmt = $conn->prepare("SELECT * FROM users WHERE email = :email");
+        $stmt->execute([':email' => $email]);
+        $user = $stmt->fetch();
+
+        if ($user && password_verify($password, $user['password'])) {
+            // Regenerate session ID to prevent session fixation
+            session_regenerate_id(true);
+            
+            // Set session variables
+            $_SESSION['user_id']  = $user['id'];
+            $_SESSION['username'] = $user['username'];
+            $_SESSION['role']     = $user['role'];
+            
+            // Set security tokens to prevent session hijacking
+            $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'];
+            $_SESSION['user_ip'] = $_SERVER['REMOTE_ADDR'];
+            $_SESSION['last_activity'] = time();
+            $_SESSION['initiated'] = true;
+            
+            // Generate unique login token
+            $_SESSION['login_token'] = generateLoginToken();
+            $_SESSION['login_token_time'] = time();
+
+            header("Location: " . ($user['role'] === 'admin' ? "adminDashboard.php" : "userDashboard.php"));
+            exit();
+        } else {
+            $error = "Invalid email or password.";
+        }
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — AirWatch</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container-sm">
+    <div class="auth-box">
+
+        <div class="auth-logo">
+            <h1>🌿 AirWatch</h1>
+            <p>Local Pollution Reporting App</p>
+        </div>
+
+        <?php if ($error): ?>
+            <div class="alert"><?php echo $error; ?></div>
+        <?php endif; ?>
+        
+        <?php if (isset($_GET['error']) && $_GET['error'] === 'session_expired'): ?>
+            <div class="alert">Your session has expired. Please log in again.</div>
+        <?php endif; ?>
+
+        <form method="POST">
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" placeholder="you@email.com" required
+                       value="<?php echo isset($_POST['email']) ? htmlspecialchars($_POST['email']) : ''; ?>">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" placeholder="Your password" required>
+            </div>
+            <button type="submit" name="login" class="btn btn-primary btn-full">Log In</button>
+        </form>
+
+        <div class="auth-footer">
+            No account yet? <a href="registration.php">Register here</a>
+        </div>
+
+    </div>
+</div>
+</body>
+</html>
+
+<?php
+session_start();
+
+// Unset all session variables
+$_SESSION = array();
+
+// Delete the session cookie
+if (isset($_COOKIE[session_name()])) {
+    setcookie(session_name(), '', time() - 3600, '/');
+}
+
+// Destroy the session
+session_destroy();
+
+// Redirect to login
+header("Location: login.php");
+exit();
+?>
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+
+header('Content-Type: application/json');
+
+$user_id = $_SESSION['user_id'];
+$notif_id = isset($_POST['notif_id']) ? (int)$_POST['notif_id'] : 0;
+
+if ($notif_id > 0) {
+    $stmt = $conn->prepare("UPDATE notifications SET is_read = 1 WHERE id = :nid AND user_id = :uid");
+    $stmt->execute([':nid' => $notif_id, ':uid' => $user_id]);
+    
+    echo json_encode(['success' => true]);
+} else {
+    // Mark all as read
+    $stmt = $conn->prepare("UPDATE notifications SET is_read = 1 WHERE user_id = :uid");
+    $stmt->execute([':uid' => $user_id]);
+    
+    echo json_encode(['success' => true, 'message' => 'All marked as read']);
+}
+?>
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+
+header('Content-Type: application/json');
+
+$user_id = $_SESSION['user_id'];
+
+// Fetch unread notifications
+$stmt = $conn->prepare("
+    SELECT n.*, r.title as report_title
+    FROM notifications n
+    LEFT JOIN reports r ON n.report_id = r.id
+    WHERE n.user_id = :uid
+    ORDER BY n.created_at DESC
+    LIMIT 50
+");
+$stmt->execute([':uid' => $user_id]);
+$notifications = $stmt->fetchAll();
+
+// Count unread
+$unread_stmt = $conn->prepare("SELECT COUNT(*) FROM notifications WHERE user_id = :uid AND is_read = 0");
+$unread_stmt->execute([':uid' => $user_id]);
+$unread_count = $unread_stmt->fetchColumn();
+
+echo json_encode([
+    'success' => true,
+    'notifications' => $notifications,
+    'unread_count' => $unread_count
+]);
+?>
+
+# AirWatch - Local Pollution Reporting App
+
+Complete pollution reporting system with user submission, admin verification, community support, and real-time tracking.
+
+---
+
+## 📋 FEATURES (Per PDF Specification)
+
+### User Features
+✅ Registration & Login  
+✅ Submit Pollution Reports (with photo, type, severity, location, GPS)  
+✅ View Live Feed of approved reports  
+✅ Filter & Search reports (by type, severity, location, date, keyword)  
+✅ Track Report Status (Pending → Under Investigation → Action Taken → Resolved)  
+✅ Community Support/Upvote System  
+✅ Real-time Pollution Alerts (High severity)  
+✅ Map Visualization (Leaflet.js)  
+✅ AQI Widget (Air Quality Index)  
+✅ Forum/Community Discussion  
+✅ Notifications System  
+
+### Admin Features
+✅ Admin Dashboard with Statistics  
+✅ Review & Validate Reports (checklist system)  
+✅ Approve/Reject Reports  
+✅ Update Report Status & Add Notes  
+✅ View Admin Activity Logs  
+✅ Reports & Analytics  
+✅ Export to CSV  
+✅ User Management  
+
+---
+
+## 🚀 SETUP INSTRUCTIONS
+
+### Step 1: Database Setup
+1. Open phpMyAdmin
+2. Import `db_complete.sql`
+3. This creates the `pollution_app` database with all tables
+
+### Step 2: Create Admin Account
+1. Place all files in your project folder (e.g., `htdocs/airwatch/`)
+2. Open `http://localhost/airwatch/create_admin.php` in your browser
+3. This creates the admin account: `admin@pollutionapp.com` / `admin123`
+4. **DELETE `create_admin.php` after running it**
+
+### Step 3: Create uploads folder
+```bash
+mkdir uploads
+chmod 755 uploads
+```
+
+### Step 4: Test Login
+- Admin: `admin@pollutionapp.com` / `admin123`
+- User: Register a new account via `registration.php`
+
+---
+
+## 📁 FILE STRUCTURE
+
+```
+airwatch/
+├── config.php              # Database connection + helper functions
+├── db_complete.sql         # Complete database schema
+├── create_admin.php        # One-time admin setup (delete after use)
+│
+├── login.php               # Login page
+├── registration.php        # User registration
+├── logout.php              # Logout handler
+│
+├── userDashboard.php       # User main dashboard (all tabs)
+├── adminDashboard.php      # Admin panel (reports, users, logs, analytics)
+│
+├── search.php              # AJAX search/filter endpoint
+├── support.php             # Upvote/support system API
+├── notifications.php       # Fetch user notifications
+├── mark_read.php           # Mark notifications as read
+├── export_csv.php          # Export reports to CSV
+│
+├── style.css               # All styling (no inline CSS)
+└── uploads/                # Photo storage (create this folder)
+```
+
+---
+
+## 🗄️ DATABASE TABLES
+
+1. **users** - User accounts (role: user/admin)
+2. **reports** - Pollution reports (all fields + status tracking)
+3. **report_supports** - Community upvotes/support
+4. **posts** - Forum posts
+5. **admin_logs** - Admin activity tracking
+6. **validation_checklist** - Report validation criteria
+7. **notifications** - User notifications
+
+---
+
+## 🎯 USER WORKFLOW (Per PDF)
+
+1. User registers and logs in
+2. Submits pollution report with:
+   - Title
+   - Pollution Type (Air, Water, Noise, Waste, Chemical, Soil, Other)
+   - Severity Level (Low, Medium, High)
+   - Description
+   - Photo (optional)
+   - Location + GPS coordinates
+3. Report is stored with status **"Pending"**
+4. Community can support/upvote the report
+5. Admin reviews and validates
+6. Admin updates status: Pending → Under Investigation → Action Taken → Resolved
+7. System sends notifications
+8. User tracks progress
+9. High-severity reports trigger alerts
+
+---
+
+## 🔧 ADMIN WORKFLOW (Per PDF)
+
+1. Admin logs in
+2. Views dashboard with:
+   - Total reports, users
+   - Pending, investigating, action taken, resolved counts
+3. Reviews reports tab:
+   - Click "Review" to see full details
+   - Click "Validate" for checklist verification
+   - Update status via dropdown
+   - Add admin notes
+4. Views activity logs (who did what, when)
+5. Views analytics (reports by type, severity, location)
+6. Exports data to CSV
+
+---
+
+## 🎨 CUSTOMIZATION
+
+### Change Colors
+Edit `style.css`:
+- Primary color: `#0066cc`
+- Success: `#28a745`
+- Warning: `#e0a800`
+- Danger: `#c0392b`
+
+### Add Pollution Types
+Edit `userDashboard.php` line ~200 (pollution type dropdown)  
+Edit `db_complete.sql` line 24 (ENUM values)
+
+### Change Status Flow
+Edit `adminDashboard.php` status dropdown options  
+Edit `db_complete.sql` line 31 (status ENUM)
+
+---
+
+## 🔑 DEFAULT ACCOUNTS
+
+**Admin:**
+- Email: `admin@pollutionapp.com`
+- Password: `admin123`
+
+**Test User** (create via registration.php):
+- Email: `user1@email.com`
+- Password: `123456`
+
+---
+
+## ⚠️ IMPORTANT NOTES
+
+1. **Security**: Change admin password after setup
+2. **File Upload**: The `uploads/` folder must have write permissions (755 or 777)
+3. **Session**: Make sure `session.save_path` is writable in php.ini
+4. **AJAX**: Some features use AJAX for real-time updates (support buttons, filters)
+5. **Maps**: Uses Leaflet.js (free, no API key required)
+6. **AQI**: Uses Open-Meteo API (free, no API key required)
+
+---
+
+## 🐛 TROUBLESHOOTING
+
+**"Connection failed" error**
+- Check database name in `config.php` (default: `pollution_app`)
+- Verify MySQL is running
+- Check username/password in `config.php`
+
+**Admin login not working**
+- Run `create_admin.php` again
+- Check `users` table in database
+
+**Photos not uploading**
+- Create `uploads/` folder
+- Set permissions: `chmod 755 uploads`
+- Check PHP `upload_max_filesize` setting
+
+**Map not showing**
+- Check internet connection (Leaflet CDN)
+- Ensure reports have latitude/longitude values
+
+---
+
+## 📊 ANALYTICS EXPLAINED
+
+Admin Dashboard → Analytics Tab shows:
+- **Total Reports**: All-time count
+- **By Type**: Air, Water, Noise, etc.
+- **By Severity**: Low, Medium, High
+- **By Status**: Pending, investigating, resolved, etc.
+- **By Location**: Most affected areas
+- **Timeline**: Reports per day/week/month
+
+---
+
+## ✅ TESTING CHECKLIST
+
+- [ ] Create admin account
+- [ ] Register as user
+- [ ] Submit report with photo
+- [ ] Test GPS location button
+- [ ] View report in feed
+- [ ] Support/upvote a report
+- [ ] Admin approves report
+- [ ] User sees status change
+- [ ] Test filters (type, severity, keyword)
+- [ ] Export CSV
+- [ ] Check notifications
+- [ ] Test forum posts
+- [ ] View map markers
+
+---
+
+## 📝 NEXT STEPS (Optional Enhancements)
+
+- Email notifications (use PHPMailer)
+- SMS alerts for high-severity (Twilio)
+- Push notifications (Firebase)
+- Mobile app (React Native)
+- Advanced analytics (Chart.js)
+- Report attachments (PDFs, videos)
+- Scheduled reports/reminders
+
+---
+
+Made for: **University of Baguio - CMARCH1 / DATSCI1**  
+Student: Kash  
+Date: April 2026
+
+<?php
+require 'config.php';
+
+// Redirect if already logged in
+redirectIfLoggedIn();
+
+$error   = "";
+$success = "";
+
+if (isset($_POST['register'])) {
+    $username = trim($_POST['username']);
+    $email    = trim($_POST['email']);
+    $password = trim($_POST['password']);
+    $confirm  = trim($_POST['confirm_password']);
+
+    if (empty($username) || empty($email) || empty($password) || empty($confirm)) {
+        $error = "All fields are required.";
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = "Invalid email address.";
+    } elseif (strlen($password) < 6) {
+        $error = "Password must be at least 6 characters.";
+    } elseif ($password !== $confirm) {
+        $error = "Passwords do not match.";
+    } else {
+        $stmt = $conn->prepare("SELECT id FROM users WHERE username = :u OR email = :e");
+        $stmt->execute([':u' => $username, ':e' => $email]);
+
+        if ($stmt->fetch()) {
+            $error = "Username or email already taken.";
+        } else {
+            $hashed = password_hash($password, PASSWORD_DEFAULT);
+            $stmt   = $conn->prepare("INSERT INTO users (username, email, password) VALUES (:u, :e, :p)");
+            $stmt->execute([':u' => $username, ':e' => $email, ':p' => $hashed]);
+            $success = "Account created! You can now <a href='login.php'>log in</a>.";
+        }
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register — AirWatch</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container-sm">
+    <div class="auth-box">
+
+        <div class="auth-logo">
+            <h1>🌿 AirWatch</h1>
+            <p>Local Pollution Reporting App</p>
+        </div>
+
+        <?php if ($error): ?>
+            <div class="alert"><?php echo $error; ?></div>
+        <?php endif; ?>
+
+        <?php if ($success): ?>
+            <div class="success-msg"><?php echo $success; ?></div>
+        <?php else: ?>
+
+        <form method="POST">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" placeholder="e.g. juandelacruz"
+                       value="<?php echo isset($_POST['username']) ? htmlspecialchars($_POST['username']) : ''; ?>" required>
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" placeholder="you@email.com"
+                       value="<?php echo isset($_POST['email']) ? htmlspecialchars($_POST['email']) : ''; ?>" required>
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" placeholder="At least 6 characters" required>
+            </div>
+            <div class="form-group">
+                <label>Confirm Password</label>
+                <input type="password" name="confirm_password" placeholder="Repeat password" required>
+            </div>
+            <button type="submit" name="register" class="btn btn-primary btn-full">Create Account</button>
+        </form>
+
+        <?php endif; ?>
+
+        <div class="auth-footer">
+            Already have an account? <a href="login.php">Log in here</a>
+        </div>
+
+    </div>
+</div>
+</body>
+</html>
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+
+header('Content-Type: application/json');
+
+try {
+    $user_id = $_SESSION['user_id'];
+    $is_admin = $_SESSION['role'] === 'admin';
+
+    // Get filter parameters
+    $type = isset($_GET['type']) && $_GET['type'] !== '' ? trim($_GET['type']) : '';
+    $severity = isset($_GET['severity']) && $_GET['severity'] !== '' ? trim($_GET['severity']) : '';
+    $date_from = isset($_GET['date_from']) && $_GET['date_from'] !== '' ? trim($_GET['date_from']) : '';
+    $date_to = isset($_GET['date_to']) && $_GET['date_to'] !== '' ? trim($_GET['date_to']) : '';
+    $location = isset($_GET['location']) && $_GET['location'] !== '' ? trim($_GET['location']) : '';
+    $search = isset($_GET['search']) && $_GET['search'] !== '' ? trim($_GET['search']) : '';
+    $scope = isset($_GET['scope']) ? trim($_GET['scope']) : 'all'; // all, my_reports, community_feed, admin_all
+
+    // Pagination
+    $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
+    $per_page = isset($_GET['per_page']) ? (int)$_GET['per_page'] : 10;
+    $offset = ($page - 1) * $per_page;
+
+    // Build query based on scope
+    $conditions = [];
+    $params = [];
+
+    // Scope-based base condition
+    if ($scope === 'my_reports') {
+        $conditions[] = "r.user_id = :user_id";
+        $params[':user_id'] = $user_id;
+    } elseif ($scope === 'community_feed') {
+        $conditions[] = "r.status = 'approved'";
+        $conditions[] = "r.is_verified = 1";
+    } elseif ($scope === 'admin_all') {
+        if (!$is_admin) {
+            echo json_encode(['success' => false, 'error' => 'Unauthorized']);
+            exit();
+        }
+        $conditions[] = "r.status IN ('approved', 'rejected', 'under_investigation', 'action_taken', 'resolved')";
+    }
+
+    // Type filter
+    if ($type) {
+        $conditions[] = "r.pollution_type = :type";
+        $params[':type'] = $type;
+    }
+
+    // Severity filter
+    if ($severity) {
+        $conditions[] = "r.severity_level = :severity";
+        $params[':severity'] = $severity;
+    }
+
+    // Date range
+    if ($date_from) {
+        $conditions[] = "DATE(r.created_at) >= :date_from";
+        $params[':date_from'] = $date_from;
+    }
+    if ($date_to) {
+        $conditions[] = "DATE(r.created_at) <= :date_to";
+        $params[':date_to'] = $date_to;
+    }
+
+    // Location filter
+    if ($location) {
+        $conditions[] = "r.location LIKE :location";
+        $params[':location'] = '%' . $location . '%';
+    }
+
+    // Search (title or description)
+    if ($search) {
+        $conditions[] = "(r.title LIKE :search OR r.description LIKE :search)";
+        $params[':search'] = '%' . $search . '%';
+    }
+
+    // Build WHERE clause
+    $where = count($conditions) > 0 ? 'WHERE ' . implode(' AND ', $conditions) : '';
+
+    // Get total count
+    $count_query = "SELECT COUNT(*) FROM reports r $where";
+    $count_stmt = $conn->prepare($count_query);
+    $count_stmt->execute($params);
+    $total_records = $count_stmt->fetchColumn();
+    $total_pages = ceil($total_records / $per_page);
+
+    // Get filtered reports
+    $query = "
+        SELECT r.*, u.username,
+               (SELECT COUNT(*) FROM report_supports WHERE report_id = r.id) as support_count,
+               (SELECT COUNT(*) FROM report_supports WHERE report_id = r.id AND user_id = :current_user_id) as user_supported
+        FROM reports r
+        JOIN users u ON r.user_id = u.id
+        $where
+        ORDER BY r.created_at DESC
+        LIMIT :limit OFFSET :offset
+    ";
+
+    $stmt = $conn->prepare($query);
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->bindValue(':current_user_id', $user_id, PDO::PARAM_INT);
+    $stmt->bindValue(':limit', $per_page, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $reports = $stmt->fetchAll();
+
+    echo json_encode([
+        'success' => true,
+        'reports' => $reports,
+        'pagination' => [
+            'current_page' => $page,
+            'total_pages' => $total_pages,
+            'total_records' => (int)$total_records,
+            'per_page' => $per_page
+        ]
+    ]);
+} catch (Exception $e) {
+    error_log("Search error: " . $e->getMessage());
+    echo json_encode([
+        'success' => false,
+        'error' => 'Database error',
+        'message' => $e->getMessage()
+    ]);
+}
+?>
+
+<?php
+session_start();
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Session Debug Info</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        .info-box { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .label { font-weight: bold; color: #0066cc; }
+        .value { color: #333; }
+        h2 { color: #0066cc; }
+    </style>
+</head>
+<body>
+    <h1>🔍 Session Debug Information</h1>
+    
+    <div class="info-box">
+        <h2>Current Session Data:</h2>
+        <?php if (isset($_SESSION['user_id'])): ?>
+            <p><span class="label">User ID:</span> <span class="value"><?php echo $_SESSION['user_id']; ?></span></p>
+            <p><span class="label">Username:</span> <span class="value"><?php echo $_SESSION['username']; ?></span></p>
+            <p><span class="label">Role:</span> <span class="value"><?php echo $_SESSION['role']; ?></span></p>
+            <p><span class="label">Login Token:</span> <span class="value"><?php echo isset($_SESSION['login_token']) ? substr($_SESSION['login_token'], 0, 20) . '...' : 'NOT SET'; ?></span></p>
+        <?php else: ?>
+            <p style="color: red;">No active session</p>
+        <?php endif; ?>
+    </div>
+    
+    <div class="info-box">
+        <h2>Security Tokens:</h2>
+        <p><span class="label">Stored User Agent:</span> <span class="value"><?php echo isset($_SESSION['user_agent']) ? substr($_SESSION['user_agent'], 0, 50) . '...' : 'NOT SET'; ?></span></p>
+        <p><span class="label">Current User Agent:</span> <span class="value"><?php echo substr($_SERVER['HTTP_USER_AGENT'], 0, 50) . '...'; ?></span></p>
+        <p><span class="label">Match:</span> <span class="value" style="color: <?php echo (isset($_SESSION['user_agent']) && $_SESSION['user_agent'] === $_SERVER['HTTP_USER_AGENT']) ? 'green' : 'red'; ?>">
+            <?php echo (isset($_SESSION['user_agent']) && $_SESSION['user_agent'] === $_SERVER['HTTP_USER_AGENT']) ? '✅ YES' : '❌ NO'; ?>
+        </span></p>
+        
+        <hr>
+        
+        <p><span class="label">Stored IP:</span> <span class="value"><?php echo isset($_SESSION['user_ip']) ? $_SESSION['user_ip'] : 'NOT SET'; ?></span></p>
+        <p><span class="label">Current IP:</span> <span class="value"><?php echo $_SERVER['REMOTE_ADDR']; ?></span></p>
+        <p><span class="label">Match:</span> <span class="value" style="color: <?php echo (isset($_SESSION['user_ip']) && $_SESSION['user_ip'] === $_SERVER['REMOTE_ADDR']) ? 'green' : 'red'; ?>">
+            <?php echo (isset($_SESSION['user_ip']) && $_SESSION['user_ip'] === $_SERVER['REMOTE_ADDR']) ? '✅ YES' : '❌ NO'; ?>
+        </span></p>
+    </div>
+    
+    <div class="info-box">
+        <h2>Session Timeout:</h2>
+        <?php if (isset($_SESSION['last_activity'])): ?>
+            <p><span class="label">Last Activity:</span> <span class="value"><?php echo date('Y-m-d H:i:s', $_SESSION['last_activity']); ?></span></p>
+            <p><span class="label">Time Since:</span> <span class="value"><?php echo (time() - $_SESSION['last_activity']); ?> seconds</span></p>
+            <p><span class="label">Expires In:</span> <span class="value"><?php echo (1800 - (time() - $_SESSION['last_activity'])); ?> seconds</span></p>
+        <?php else: ?>
+            <p>No activity timestamp</p>
+        <?php endif; ?>
+    </div>
+    
+    <p><a href="login.php">← Back to Login</a></p>
+</body>
+</html>
+
+/* =============================================
+   style.css — AirWatch Basic Stylesheet
+   ============================================= */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f4f4f4;
+    color: #333;
+}
+
+/* ---- Layout ---- */
+
+.container {
+    max-width: 960px;
+    margin: 30px auto;
+    padding: 0 20px;
+}
+
+.container-sm {
+    max-width: 450px;
+    margin: 60px auto;
+    padding: 0 20px;
+}
+
+/* ---- Card ---- */
+
+.card {
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    margin-bottom: 20px;
+}
+
+.card-header {
+    padding: 12px 16px;
+    font-weight: bold;
+    font-size: 1rem;
+    background-color: #e8e8e8;
+    border-bottom: 1px solid #ccc;
+    border-radius: 6px 6px 0 0;
+}
+
+.card-body {
+    padding: 20px;
+}
+
+/* ---- Top Nav ---- */
+
+.topnav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 10px 20px;
+    margin-bottom: 20px;
+}
+
+.topnav .brand {
+    font-size: 1.1rem;
+    font-weight: bold;
+}
+
+.topnav .user-info {
+    font-size: 0.85rem;
+    color: #555;
+}
+
+/* ---- Auth Box ---- */
+
+.auth-box {
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 30px;
+}
+
+.auth-logo {
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+.auth-logo h1 {
+    font-size: 1.6rem;
+}
+
+.auth-logo p {
+    font-size: 0.85rem;
+    color: #666;
+    margin-top: 4px;
+}
+
+.auth-footer {
+    text-align: center;
+    margin-top: 14px;
+    font-size: 0.85rem;
+    color: #555;
+}
+
+.auth-footer a {
+    color: #0066cc;
+}
+
+/* ---- Forms ---- */
+
+.form-group {
+    margin-bottom: 14px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 0.9rem;
+    font-weight: bold;
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    background: #fff;
+    color: #333;
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+    outline: none;
+    border-color: #0066cc;
+}
+
+.form-group textarea {
+    resize: vertical;
+}
+
+.form-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 10px;
+}
+
+/* ---- Buttons ---- */
+
+.btn {
+    display: inline-block;
+    padding: 7px 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.88rem;
+    font-weight: bold;
+    cursor: pointer;
+    text-decoration: none;
+}
+
+.btn-primary   { background-color: #0066cc; color: #fff; }
+.btn-success   { background-color: #28a745; color: #fff; }
+.btn-warning   { background-color: #e0a800; color: #fff; }
+.btn-danger    { background-color: #c0392b; color: #fff; }
+.btn-secondary { background-color: #6c757d; color: #fff; }
+
+.btn:hover { opacity: 0.85; }
+
+.btn-sm {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+    margin-right: 3px;
+}
+
+.btn-full {
+    width: 100%;
+    padding: 10px;
+    text-align: center;
+}
+
+/* ---- Table ---- */
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+    font-size: 0.9rem;
+}
+
+thead tr {
+    background-color: #f0f0f0;
+}
+
+tbody tr:hover {
+    background-color: #f9f9f9;
+}
+
+/* ---- Alerts / Messages ---- */
+
+.alert {
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 14px;
+    font-size: 0.9rem;
+    background-color: #fde8e8;
+    color: #c0392b;
+    border: 1px solid #f5c6c6;
+}
+
+.success-msg {
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 14px;
+    font-size: 0.9rem;
+    background-color: #e6f4ea;
+    color: #1e7e34;
+    border: 1px solid #b2dfbc;
+}
+
+.success-msg a { color: #1e7e34; }
+
+/* ---- Tabs ---- */
+
+.tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    padding: 8px 16px;
+    background: #e8e8e8;
+    border: 1px solid #ccc;
+    border-radius: 4px 4px 0 0;
+    cursor: pointer;
+    font-size: 0.88rem;
+    font-weight: bold;
+    color: #333;
+}
+
+.tab-btn.active {
+    background: #fff;
+    border-bottom-color: #fff;
+    color: #0066cc;
+}
+
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+/* ---- Stats Grid ---- */
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+}
+
+.stat-card {
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 18px;
+    text-align: center;
+}
+
+.stat-card .num {
+    font-size: 2rem;
+    font-weight: bold;
+    color: #0066cc;
+}
+
+.stat-card .label {
+    font-size: 0.8rem;
+    color: #666;
+    margin-top: 4px;
+}
+
+/* ---- Badges ---- */
+
+.badge {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 10px;
+    font-size: 0.78rem;
+    font-weight: bold;
+}
+
+.badge-pending  { background: #fff3cd; color: #856404; border: 1px solid #ffc107; }
+.badge-approved { background: #d4edda; color: #155724; border: 1px solid #28a745; }
+.badge-rejected { background: #fde8e8; color: #721c24; border: 1px solid #c0392b; }
+
+/* ---- Feed Cards ---- */
+
+.feed-card {
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+}
+
+.feed-card .meta {
+    font-size: 0.78rem;
+    color: #777;
+    margin-bottom: 6px;
+}
+
+.feed-card .feed-title {
+    font-size: 1rem;
+    font-weight: bold;
+    margin-bottom: 6px;
+}
+
+.feed-card .feed-desc {
+    font-size: 0.88rem;
+    color: #444;
+}
+
+.feed-card img {
+    width: 100%;
+    max-height: 200px;
+    object-fit: cover;
+    border-radius: 4px;
+    margin-top: 10px;
+    border: 1px solid #ddd;
+}
+
+/* ---- Forum ---- */
+
+.forum-post {
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 10px;
+}
+
+.forum-post .poster {
+    font-size: 0.85rem;
+    font-weight: bold;
+    color: #0066cc;
+}
+
+.forum-post .post-time {
+    font-size: 0.78rem;
+    color: #888;
+    margin-left: 8px;
+}
+
+.forum-post .post-body {
+    margin-top: 8px;
+    font-size: 0.9rem;
+}
+
+/* ---- AQI Widget ---- */
+
+.aqi-widget {
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 16px 20px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.aqi-circle {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    border: 3px solid #ccc;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    flex-shrink: 0;
+}
+
+.aqi-num {
+    font-size: 1.6rem;
+    line-height: 1;
+}
+
+.aqi-label {
+    font-size: 0.65rem;
+    color: #666;
+    margin-top: 2px;
+}
+
+.aqi-details h3 {
+    font-size: 1rem;
+    margin-bottom: 4px;
+}
+
+.aqi-details p {
+    font-size: 0.82rem;
+    color: #555;
+}
+
+.aqi-status-text {
+    font-size: 0.95rem;
+    font-weight: bold;
+    margin-top: 4px;
+}
+
+/* ---- Map ---- */
+
+#report-map {
+    height: 360px;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+}
+
+/* ---- Photo Thumbnail ---- */
+
+.photo-thumb {
+    width: 48px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+}
+
+/* ---- Misc ---- */
+
+.text-muted {
+    color: #888;
+    font-size: 0.85rem;
+}
+
+.mb-10 { margin-bottom: 10px; }
+.mt-10 { margin-top: 10px; }
+.text-center { text-align: center; }
+
+/* ---- Modals ---- */
+
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.5);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background: white;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 600px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    max-height: 85vh;
+    overflow-y: auto;
+}
+
+.modal-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid #ddd;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-header h2 {
+    margin: 0;
+    font-size: 1.2rem;
+}
+
+.modal-close {
+    font-size: 28px;
+    cursor: pointer;
+    color: #999;
+    line-height: 1;
+}
+
+.modal-close:hover {
+    color: #333;
+}
+
+.modal-body {
+    padding: 20px;
+}
+
+/* ---- Notifications ---- */
+
+.notification-badge {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    background: #c0392b;
+    color: white;
+    border-radius: 10px;
+    padding: 2px 6px;
+    font-size: 0.7rem;
+    font-weight: bold;
+}
+
+.notification-item {
+    padding: 12px;
+    border-bottom: 1px solid #eee;
+    cursor: pointer;
+}
+
+.notification-item:hover {
+    background-color: #f9f9f9;
+}
+
+.notification-item.unread {
+    background-color: #f0f8ff;
+}
+
+.notification-title {
+    font-weight: bold;
+    font-size: 0.9rem;
+    margin-bottom: 4px;
+}
+
+.notification-message {
+    font-size: 0.85rem;
+    color: #666;
+}
+
+.notification-time {
+    font-size: 0.75rem;
+    color: #999;
+    margin-top: 4px;
+}
+
+/* ---- Filters ---- */
+
+.filter-box {
+    background: #f9f9f9;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 16px;
+    margin-bottom: 20px;
+}
+
+.filter-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.filter-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+/* ---- Support Button ---- */
+
+.support-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border: 1px solid #ddd;
+    background: white;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+}
+
+.support-btn:hover {
+    background: #f5f5f5;
+    border-color: #0066cc;
+}
+
+.support-btn.active {
+    background: #0066cc;
+    color: white;
+    border-color: #0066cc;
+}
+
+.support-count {
+    font-weight: bold;
+}
+
+/* ---- Analytics Cards ---- */
+
+.analytics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.analytics-card {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 16px;
+}
+
+.analytics-card h4 {
+    font-size: 0.85rem;
+    color: #666;
+    margin-bottom: 8px;
+}
+
+.analytics-card .value {
+    font-size: 1.8rem;
+    font-weight: bold;
+    color: #0066cc;
+}
+
+/* ---- Status Colors ---- */
+
+.status-pending { color: #856404; }
+.status-under_investigation { color: #0066cc; }
+.status-action_taken { color: #e0a800; }
+.status-resolved { color: #28a745; }
+.status-rejected { color: #c0392b; }
+.status-approved { color: #28a745; }
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+
+header('Content-Type: application/json');
+
+$user_id = $_SESSION['user_id'];
+$report_id = isset($_POST['report_id']) ? (int)$_POST['report_id'] : 0;
+
+if ($report_id <= 0) {
+    echo json_encode(['success' => false, 'message' => 'Invalid report ID']);
+    exit();
+}
+
+// Check if user already supported this report
+$check_stmt = $conn->prepare("SELECT id FROM report_supports WHERE report_id = :rid AND user_id = :uid");
+$check_stmt->execute([':rid' => $report_id, ':uid' => $user_id]);
+
+if ($check_stmt->fetch()) {
+    // Already supported - remove support
+    $del_stmt = $conn->prepare("DELETE FROM report_supports WHERE report_id = :rid AND user_id = :uid");
+    $del_stmt->execute([':rid' => $report_id, ':uid' => $user_id]);
+    
+    // Decrement count
+    $conn->prepare("UPDATE reports SET support_count = support_count - 1 WHERE id = :rid")->execute([':rid' => $report_id]);
+    
+    // Get new count
+    $count = $conn->prepare("SELECT support_count FROM reports WHERE id = :rid");
+    $count->execute([':rid' => $report_id]);
+    $new_count = $count->fetchColumn();
+    
+    echo json_encode([
+        'success' => true,
+        'action' => 'removed',
+        'message' => 'Support removed',
+        'support_count' => $new_count
+    ]);
+} else {
+    // Add support
+    $ins_stmt = $conn->prepare("INSERT INTO report_supports (report_id, user_id) VALUES (:rid, :uid)");
+    $ins_stmt->execute([':rid' => $report_id, ':uid' => $user_id]);
+    
+    // Increment count
+    $conn->prepare("UPDATE reports SET support_count = support_count + 1 WHERE id = :rid")->execute([':rid' => $report_id]);
+    
+    // Get report owner
+    $owner_stmt = $conn->prepare("SELECT user_id FROM reports WHERE id = :rid");
+    $owner_stmt->execute([':rid' => $report_id]);
+    $owner_id = $owner_stmt->fetchColumn();
+    
+    // Create notification for report owner
+    if ($owner_id && $owner_id != $user_id) {
+        $notif_stmt = $conn->prepare("
+            INSERT INTO notifications (user_id, report_id, type, title, message)
+            VALUES (:uid, :rid, 'support_received', 'Your report received support', 'Someone confirmed your pollution report')
+        ");
+        $notif_stmt->execute([':uid' => $owner_id, ':rid' => $report_id]);
+    }
+    
+    // Get new count
+    $count = $conn->prepare("SELECT support_count FROM reports WHERE id = :rid");
+    $count->execute([':rid' => $report_id]);
+    $new_count = $count->fetchColumn();
+    
+    echo json_encode([
+        'success' => true,
+        'action' => 'added',
+        'message' => 'Support added',
+        'support_count' => $new_count
+    ]);
+}
+?>
+
+-- =============================================
+-- Add missing columns to existing reports table
+-- Run this if you already have a reports table
+-- =============================================
+
+USE pollution_app;
+
+-- Add new columns to reports table
+ALTER TABLE reports 
+ADD COLUMN IF NOT EXISTS pollution_type ENUM('Air','Water','Noise','Waste','Chemical','Soil','Other') NOT NULL DEFAULT 'Other' AFTER title,
+ADD COLUMN IF NOT EXISTS severity_level ENUM('Low','Medium','High') NOT NULL DEFAULT 'Low' AFTER pollution_type,
+ADD COLUMN IF NOT EXISTS admin_notes TEXT AFTER status,
+ADD COLUMN IF NOT EXISTS is_verified TINYINT(1) DEFAULT 0 AFTER admin_notes,
+ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP NULL AFTER is_verified,
+ADD COLUMN IF NOT EXISTS verified_by INT NULL AFTER verified_at,
+ADD COLUMN IF NOT EXISTS support_count INT DEFAULT 0 AFTER verified_by;
+
+-- Update status column to include new statuses
+ALTER TABLE reports 
+MODIFY COLUMN status ENUM('pending','under_investigation','action_taken','resolved','rejected','approved') DEFAULT 'pending';
+
+-- Add foreign key for verified_by if it doesn't exist
+ALTER TABLE reports 
+ADD CONSTRAINT fk_verified_by FOREIGN KEY (verified_by) REFERENCES users(id) ON DELETE SET NULL;
+
+-- Create missing tables if they don't exist
+
+CREATE TABLE IF NOT EXISTS report_supports (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    report_id   INT NOT NULL,
+    user_id     INT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_support (report_id, user_id),
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS admin_logs (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    admin_id    INT NOT NULL,
+    report_id   INT NULL,
+    action      VARCHAR(100) NOT NULL,
+    old_status  VARCHAR(50) NULL,
+    new_status  VARCHAR(50) NULL,
+    notes       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS validation_checklist (
+    id                      INT AUTO_INCREMENT PRIMARY KEY,
+    report_id               INT NOT NULL,
+    admin_id                INT NOT NULL,
+    photo_attached          TINYINT(1) DEFAULT 0,
+    location_valid          TINYINT(1) DEFAULT 0,
+    description_adequate    TINYINT(1) DEFAULT 0,
+    severity_appropriate    TINYINT(1) DEFAULT 0,
+    no_duplicates           TINYINT(1) DEFAULT 0,
+    overall_valid           TINYINT(1) DEFAULT 0,
+    validation_notes        TEXT,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE,
+    FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    report_id   INT NULL,
+    type        ENUM('new_report','status_update','admin_action','support_received','high_severity_alert') NOT NULL,
+    title       VARCHAR(200) NOT NULL,
+    message     TEXT NOT NULL,
+    is_read     TINYINT(1) DEFAULT 0,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE
+);
+
+SELECT 'Database update completed successfully!' as Status;
+
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+
+$user_id = $_SESSION['user_id'];
+$username = $_SESSION['username'];
+$error   = "";
+$success = "";
+
+// Catch the redirect success message
+if (isset($_GET['success']) && $_GET['success'] === 'report_submitted') {
+    $success = "Your report was submitted! It will appear after admin review.";
+}
+
+
+// ---- Handle report submission ----
+if (isset($_POST['submit_report'])) {
+    $title            = trim($_POST['title']);
+    $pollution_type   = trim($_POST['pollution_type']);
+    $severity_level   = trim($_POST['severity_level']);
+    $description      = trim($_POST['description']);
+    $location         = trim($_POST['location']);
+    $latitude         = trim($_POST['latitude']);
+    $longitude        = trim($_POST['longitude']);
+    $photo            = null;
+
+    if (empty($title)) {
+        $error = "Report title is required.";
+    } elseif (empty($pollution_type)) {
+        $error = "Please select a pollution type.";
+    } elseif (empty($severity_level)) {
+        $error = "Please select a severity level.";
+    } else {
+        if (!empty($_FILES['photo']['name'])) {
+            $allowed = ['jpg','jpeg','png','gif','webp'];
+            $ext     = strtolower(pathinfo($_FILES['photo']['name'], PATHINFO_EXTENSION));
+
+            if (!in_array($ext, $allowed)) {
+                $error = "Only image files are allowed (jpg, png, gif, webp).";
+            } elseif ($_FILES['photo']['size'] > 5 * 1024 * 1024) {
+                $error = "Photo must be under 5MB.";
+            } else {
+                if (!is_dir('uploads')) mkdir('uploads', 0755, true);
+                $filename = uniqid('report_') . '.' . $ext;
+                move_uploaded_file($_FILES['photo']['tmp_name'], 'uploads/' . $filename);
+                $photo = $filename;
+            }
+        }
+
+        if (empty($error)) {
+            $stmt = $conn->prepare("
+                INSERT INTO reports (user_id, title, pollution_type, severity_level, description, photo, location, latitude, longitude)
+                VALUES (:uid, :title, :ptype, :severity, :desc, :photo, :loc, :lat, :lng)
+            ");
+            $stmt->execute([
+                ':uid'      => $user_id,
+                ':title'    => $title,
+                ':ptype'    => $pollution_type,
+                ':severity' => $severity_level,
+                ':desc'     => $description,
+                ':photo'    => $photo,
+                ':loc'      => $location,
+                ':lat'      => $latitude ?: null,
+                ':lng'      => $longitude ?: null,
+            ]);
+            
+            // Create notification for high severity
+            if ($severity_level === 'High') {
+                // Notify all users about high severity alert
+                $alert_stmt = $conn->prepare("
+                    INSERT INTO notifications (user_id, report_id, type, title, message)
+                    SELECT id, LAST_INSERT_ID(), 'high_severity_alert', 'High Severity Alert', CONCAT('High severity pollution reported: ', :title)
+                    FROM users WHERE id != :uid
+                ");
+                $alert_stmt->execute([':title' => $title, ':uid' => $user_id]);
+            }
+            
+            // Redirect to prevent form resubmission on refresh
+            header("Location: userDashboard.php?success=report_submitted");
+            exit();
+        }
+    }
+}
+
+// ---- Handle forum post ----
+if (isset($_POST['post_forum'])) {
+    $content = trim($_POST['content']);
+    if (!empty($content)) {
+        $stmt = $conn->prepare("INSERT INTO posts (user_id, content) VALUES (:uid, :c)");
+        $stmt->execute([':uid' => $user_id, ':c' => $content]);
+        header("Location: userDashboard.php#forum");
+        exit();
+    }
+}
+
+// ---- DASHBOARD DATA (Section 2 from PDF) ----
+
+// My recent reports (last 5)
+$stmt = $conn->prepare("SELECT * FROM reports WHERE user_id = :uid ORDER BY created_at DESC LIMIT 5");
+$stmt->execute([':uid' => $user_id]);
+$recent_reports = $stmt->fetchAll();
+
+// Count my reports by status
+$stmt = $conn->prepare("
+    SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'under_investigation' THEN 1 ELSE 0 END) as investigating,
+        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved
+    FROM reports WHERE user_id = :uid
+");
+$stmt->execute([':uid' => $user_id]);
+$my_stats = $stmt->fetch();
+
+// Nearby incidents (approved reports with location - last 10)
+$stmt = $conn->prepare("
+    SELECT r.*, u.username,
+    (SELECT COUNT(*) FROM report_supports WHERE report_id = r.id AND user_id = :uid) as user_supported
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.status = 'approved' AND r.latitude IS NOT NULL AND r.longitude IS NOT NULL
+    ORDER BY r.created_at DESC
+    LIMIT 10
+");
+$stmt->execute([':uid' => $user_id]);
+$nearby_incidents = $stmt->fetchAll();
+
+// Unread notifications count
+$stmt = $conn->prepare("SELECT COUNT(*) FROM notifications WHERE user_id = :uid AND is_read = 0");
+$stmt->execute([':uid' => $user_id]);
+$unread_notif_count = $stmt->fetchColumn();
+
+// Latest notifications (5)
+$stmt = $conn->prepare("
+    SELECT n.*, r.title as report_title
+    FROM notifications n
+    LEFT JOIN reports r ON n.report_id = r.id
+    WHERE n.user_id = :uid
+    ORDER BY n.created_at DESC
+    LIMIT 5
+");
+$stmt->execute([':uid' => $user_id]);
+$latest_notifications = $stmt->fetchAll();
+
+// ---- Full report list for other tabs ----
+$stmt = $conn->prepare("SELECT * FROM reports WHERE user_id = :uid ORDER BY created_at DESC");
+$stmt->execute([':uid' => $user_id]);
+$my_reports = $stmt->fetchAll();
+
+// Approved reports for feed/map
+$stmt = $conn->prepare("
+    SELECT r.*, u.username,
+    (SELECT COUNT(*) FROM report_supports WHERE report_id = r.id AND user_id = :uid) as user_supported
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.status = 'approved'
+    ORDER BY r.created_at DESC
+");
+$stmt->execute([':uid' => $user_id]);
+$approved_reports = $stmt->fetchAll();
+
+// Forum posts
+$stmt = $conn->prepare("
+    SELECT p.*, u.username
+    FROM posts p
+    JOIN users u ON p.user_id = u.id
+    ORDER BY p.created_at DESC
+    LIMIT 50
+");
+$stmt->execute();
+$forum_posts = $stmt->fetchAll();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard — AirWatch</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+<div class="container">
+
+    <!-- Top Nav -->
+    <div class="topnav">
+        <div class="brand">AirWatch</div>
+        <div class="user-info">
+            <span id="notif-bell" style="position:relative; margin-right:16px; cursor:pointer;" onclick="toggleNotifications()">
+                🔔
+                <?php if ($unread_notif_count > 0): ?>
+                <span class="notification-badge"><?php echo $unread_notif_count; ?></span>
+                <?php endif; ?>
+            </span>
+            👤 <strong><?php echo htmlspecialchars($username); ?></strong>
+            &nbsp;|&nbsp;
+            <a href="logout.php" class="btn btn-danger btn-sm">Logout</a>
+        </div>
+    </div>
+
+    <!-- Notification Dropdown -->
+    <div id="notification-dropdown" class="card" style="display:none; position:absolute; right:20px; top:70px; width:350px; max-height:400px; overflow-y:auto; z-index:999;">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+            <span>Notifications</span>
+            <button onclick="markAllRead()" class="btn btn-sm btn-secondary">Mark all read</button>
+        </div>
+        <div id="notification-list">
+            <?php if (empty($latest_notifications)): ?>
+                <div style="padding:20px; text-align:center; color:#999;">No notifications</div>
+            <?php else: ?>
+                <?php foreach ($latest_notifications as $notif): ?>
+                <div class="notification-item <?php echo $notif['is_read'] ? '' : 'unread'; ?>" 
+                     onclick="markRead(<?php echo $notif['id']; ?>)">
+                    <div class="notification-title"><?php echo htmlspecialchars($notif['title']); ?></div>
+                    <div class="notification-message"><?php echo htmlspecialchars($notif['message']); ?></div>
+                    <div class="notification-time"><?php echo date('M d, g:i A', strtotime($notif['created_at'])); ?></div>
+                </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- AQI Widget -->
+    <div class="aqi-widget">
+        <div class="aqi-circle" id="aqi-circle">
+            <div class="aqi-num" id="aqi-num">—</div>
+            <div class="aqi-label">AQI</div>
+        </div>
+        <div class="aqi-details">
+            <h3>🌍 Air Quality — <span id="aqi-city">Loading...</span></h3>
+            <div class="aqi-status-text" id="aqi-status">Fetching data...</div>
+            <p id="aqi-advice"></p>
+            <p class="text-muted">
+                Source: Open-Meteo (free, no API key) &nbsp;|&nbsp;
+                <button onclick="fetchAQI()" style="background:none; border:none; color:#0066cc; cursor:pointer; font-size:0.8rem; padding:0;">↻ Refresh</button>
+            </p>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('dashboard', this)">Dashboard</button>
+        <button class="tab-btn" onclick="switchTab('submit', this)">Submit Report</button>
+        <button class="tab-btn" onclick="switchTab('my', this)">My Reports</button>
+        <button class="tab-btn" onclick="switchTab('map', this)">Map</button>
+        <button class="tab-btn" onclick="switchTab('feed', this)">Community Feed</button>
+        <button class="tab-btn" onclick="switchTab('forum', this)" id="forum-tab-btn">Forum</button>
+    </div>
+
+    <!-- ===================== Tab: DASHBOARD (Section 2 from PDF) ===================== -->
+    <div id="tab-dashboard" class="tab-content active">
+        
+        <!-- Welcome Message -->
+        <div class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:white; border:none;">
+            <div class="card-body">
+                <h2 style="margin:0 0 8px 0; color:white;">Welcome back, <?php echo htmlspecialchars($username); ?>! 👋</h2>
+                <p style="margin:0; opacity:0.9;">Track pollution reports, stay informed about incidents in your area, and contribute to a cleaner environment.</p>
+            </div>
+        </div>
+
+        <!-- Quick Summary Cards -->
+        <div class="stats-grid" style="margin-top:20px;">
+            <div class="stat-card">
+                <div class="num"><?php echo $my_stats['total']; ?></div>
+                <div class="label">My Total Reports</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#e0a800;"><?php echo $my_stats['pending']; ?></div>
+                <div class="label">Pending Review</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#0066cc;"><?php echo $my_stats['investigating']; ?></div>
+                <div class="label">Under Investigation</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#28a745;"><?php echo $my_stats['resolved']; ?></div>
+                <div class="label">Resolved</div>
+            </div>
+        </div>
+
+        <!-- Recent Reports (AJAX auto-refresh) -->
+        <div class="card" style="margin-top:20px;">
+            <div class="card-header">
+                My Recent Reports
+                <span style="float:right; font-size:0.8rem; font-weight:normal; color:#666;" id="last-update">
+                    Last updated: <span id="update-time">just now</span>
+                </span>
+            </div>
+            <div class="card-body" style="padding:0;">
+                <table id="recent-reports-table">
+                    <thead>
+                        <tr>
+                            <th>Title</th>
+                            <th>Type</th>
+                            <th>Severity</th>
+                            <th>Status</th>
+                            <th>Date</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent-reports-body">
+                        <?php if (empty($recent_reports)): ?>
+                        <tr><td colspan="5" class="text-center text-muted" style="padding:20px;">
+                            No reports yet. <a href="#" onclick="switchTab('submit', document.querySelectorAll('.tab-btn')[1]); return false;">Submit your first report</a>
+                        </td></tr>
+                        <?php else: ?>
+                        <?php foreach ($recent_reports as $r): ?>
+                        <tr>
+                            <td><?php echo htmlspecialchars($r['title']); ?></td>
+                            <td><?php echo htmlspecialchars($r['pollution_type']); ?></td>
+                            <td>
+                                <span style="color:<?php echo $r['severity_level'] === 'High' ? '#c0392b' : ($r['severity_level'] === 'Medium' ? '#e0a800' : '#28a745'); ?>">
+                                    <?php echo $r['severity_level']; ?>
+                                </span>
+                            </td>
+                            <td>
+                                <span class="badge badge-<?php echo $r['status']; ?>">
+                                    <?php echo ucfirst(str_replace('_', ' ', $r['status'])); ?>
+                                </span>
+                            </td>
+                            <td><?php echo date('M d, Y', strtotime($r['created_at'])); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Nearby Incidents (AJAX auto-refresh) -->
+        <div class="card" style="margin-top:20px;">
+            <div class="card-header">
+                Nearby Pollution Incidents
+                <span style="float:right; font-size:0.8rem; font-weight:normal;">
+                    <span id="nearby-count"><?php echo count($nearby_incidents); ?></span> active incidents
+                </span>
+            </div>
+            <div class="card-body" id="nearby-incidents-container">
+                <?php if (empty($nearby_incidents)): ?>
+                    <p class="text-muted">No nearby incidents reported.</p>
+                <?php else: ?>
+                    <?php foreach ($nearby_incidents as $incident): ?>
+                    <div class="feed-card" style="margin-bottom:12px;">
+                        <div class="meta">
+                            <?php echo htmlspecialchars($incident['location']); ?> &nbsp;·&nbsp;
+                            <?php echo date('M d, Y', strtotime($incident['created_at'])); ?> &nbsp;·&nbsp;
+                            By <strong><?php echo htmlspecialchars($incident['username']); ?></strong>
+                        </div>
+                        <div class="feed-title"><?php echo htmlspecialchars($incident['title']); ?></div>
+                        <div style="margin-top:6px;">
+                            <span class="badge badge-<?php echo $incident['severity_level']; ?>" style="background:<?php echo $incident['severity_level'] === 'High' ? '#c0392b' : ($incident['severity_level'] === 'Medium' ? '#e0a800' : '#28a745'); ?>; color:white;">
+                                <?php echo $incident['severity_level']; ?> Severity
+                            </span>
+                            &nbsp;
+                            <button class="support-btn <?php echo $incident['user_supported'] ? 'active' : ''; ?>" 
+                                    onclick="toggleSupport(<?php echo $incident['id']; ?>, this)">
+                                Support (<span class="support-count"><?php echo $incident['support_count']; ?></span>)
+                            </button>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ===================== Tab: Submit Report ===================== -->
+    <div id="tab-submit" class="tab-content">
+        <div class="card">
+            <div class="card-header">Submit a Pollution Report</div>
+            <div class="card-body">
+
+                <?php if ($error): ?>
+                    <div class="alert"><?php echo $error; ?></div>
+                <?php endif; ?>
+                <?php if ($success): ?>
+                    <div class="success-msg"><?php echo $success; ?></div>
+                <?php endif; ?>
+
+                <form method="POST" enctype="multipart/form-data">
+                    <div class="form-group">
+                        <label>Report Title *</label>
+                        <input type="text" name="title" placeholder="e.g. Illegal dumping near river" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Pollution Type *</label>
+                        <select name="pollution_type" required>
+                            <option value="">-- Select Type --</option>
+                            <option value="Air">🌫️ Air Pollution</option>
+                            <option value="Water">💧 Water Pollution</option>
+                            <option value="Noise">🔊 Noise Pollution</option>
+                            <option value="Waste">🗑️ Waste/Littering</option>
+                            <option value="Chemical">☢️ Chemical/Hazardous</option>
+                            <option value="Soil">⛰️ Soil Contamination</option>
+                            <option value="Other">⚠️ Other</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Severity Level *</label>
+                        <select name="severity_level" required>
+                            <option value="">-- Select Severity --</option>
+                            <option value="Low">🟢 Low - Minor issue</option>
+                            <option value="Medium">🟡 Medium - Moderate concern</option>
+                            <option value="High">🔴 High - Urgent action needed</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Description</label>
+                        <textarea name="description" rows="4" placeholder="Describe what you observed in detail..."></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Location</label>
+                        <input type="text" name="location" placeholder="e.g. Near Burnham Park, Baguio City">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Photo (optional, max 5MB)</label>
+                        <input type="file" name="photo" accept="image/*">
+                    </div>
+
+                    <input type="hidden" name="latitude"  id="lat-input">
+                    <input type="hidden" name="longitude" id="lng-input">
+
+                    <div class="mb-10">
+                        <button type="button" onclick="getLocation()" class="btn btn-secondary">
+                            Use My Current Location
+                        </button>
+                        <span id="gps-status" class="text-muted">&nbsp;</span>
+                    </div>
+
+                    <div class="form-footer">
+                        <span></span>
+                        <button type="submit" name="submit_report" class="btn btn-primary">Submit Report</button>
+                    </div>
+                </form>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- ===================== Tab: My Reports ===================== -->
+    <div id="tab-my" class="tab-content">
+        <div class="card">
+            <div class="card-header">My Reports</div>
+            <div class="card-body">
+                <!-- Filter Form -->
+                <div style="background: #f8f9fa; padding: 16px; border-radius: 6px; margin-bottom: 16px;">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Pollution Type</label>
+                            <select id="my-filter-type" class="form-control" style="width: 100%;">
+                                <option value="">All Types</option>
+                                <option value="Air">Air</option>
+                                <option value="Water">Water</option>
+                                <option value="Noise">Noise</option>
+                                <option value="Waste">Waste</option>
+                                <option value="Chemical">Chemical</option>
+                                <option value="Soil">Soil</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Severity</label>
+                            <select id="my-filter-severity" class="form-control" style="width: 100%;">
+                                <option value="">All Severities</option>
+                                <option value="Low">Low</option>
+                                <option value="Medium">Medium</option>
+                                <option value="High">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Date</label>
+                            <input type="date" id="my-filter-date" class="form-control" style="width: 100%;">
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Location</label>
+                            <input type="text" id="my-filter-location" class="form-control" placeholder="Search location..." style="width: 100%;">
+                        </div>
+                    </div>
+                    <div style="margin-top: 12px; display: flex; gap: 8px;">
+                        <button onclick="applyMyReportsFilters()" class="btn btn-primary btn-sm">Apply Filters</button>
+                        <button onclick="clearMyReportsFilters()" class="btn btn-secondary btn-sm">Clear</button>
+                    </div>
+                </div>
+
+                <!-- Reports Table -->
+                <div style="padding: 0;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Title</th>
+                                <th>Type</th>
+                                <th>Severity</th>
+                                <th>Location</th>
+                                <th>Status</th>
+                                <th>Date</th>
+                            </tr>
+                        </thead>
+                        <tbody id="my-reports-tbody">
+                            <?php if (empty($my_reports)): ?>
+                            <tr><td colspan="6" class="text-center text-muted" style="padding:16px;">
+                                You haven't submitted any reports yet.
+                            </td></tr>
+                            <?php else: ?>
+                            <?php foreach ($my_reports as $r): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($r['title']); ?></td>
+                                <td><?php echo htmlspecialchars($r['pollution_type']); ?></td>
+                                <td><?php echo htmlspecialchars($r['severity_level']); ?></td>
+                                <td><?php echo htmlspecialchars($r['location'] ?? '—'); ?></td>
+                                <td>
+                                    <span class="badge badge-<?php echo $r['status']; ?>">
+                                        <?php echo ucfirst(str_replace('_', ' ', $r['status'])); ?>
+                                    </span>
+                                </td>
+                                <td><?php echo date('M d, Y', strtotime($r['created_at'])); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===================== Tab: Map ===================== -->
+    <div id="tab-map" class="tab-content">
+        <div class="card">
+            <div class="card-header">Report Map - Approved Reports</div>
+            <div class="card-body">
+                <div id="report-map"></div>
+                <p class="text-muted mt-10">
+                    Showing <?php echo count($approved_reports); ?> approved report(s). Click a pin to view details.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===================== Tab: Community Feed (Section 4 - AJAX Live Updates) ===================== -->
+    <div id="tab-feed" class="tab-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+            <h3 style="margin: 0;">Community Feed (Live)</h3>
+            <span style="font-size: 0.85rem; color: #666;">
+                Auto-refresh: <span id="feed-countdown">30</span>s | 
+                Last update: <span id="feed-update-time">just now</span>
+            </span>
+        </div>
+
+        <!-- Filter Form -->
+        <div style="background: #f8f9fa; padding: 16px; border-radius: 6px; margin-bottom: 16px;">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
+                <div>
+                    <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Pollution Type</label>
+                    <select id="feed-filter-type" class="form-control" style="width: 100%;">
+                        <option value="">All Types</option>
+                        <option value="Air">Air</option>
+                        <option value="Water">Water</option>
+                        <option value="Noise">Noise</option>
+                        <option value="Waste">Waste</option>
+                        <option value="Chemical">Chemical</option>
+                        <option value="Soil">Soil</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Severity</label>
+                    <select id="feed-filter-severity" class="form-control" style="width: 100%;">
+                        <option value="">All Severities</option>
+                        <option value="Low">Low</option>
+                        <option value="Medium">Medium</option>
+                        <option value="High">High</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Date</label>
+                    <input type="date" id="feed-filter-date" class="form-control" style="width: 100%;">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Location</label>
+                    <input type="text" id="feed-filter-location" class="form-control" placeholder="Search location..." style="width: 100%;">
+                </div>
+            </div>
+            <div style="margin-top: 12px; display: flex; gap: 8px;">
+                <button onclick="applyFeedFilters()" class="btn btn-primary btn-sm">Apply Filters</button>
+                <button onclick="clearFeedFilters()" class="btn btn-secondary btn-sm">Clear</button>
+            </div>
+        </div>
+
+        <div id="community-feed-container">
+            <?php if (empty($approved_reports)): ?>
+                <p class="text-muted">No approved reports yet.</p>
+            <?php else: ?>
+            <?php foreach ($approved_reports as $r): ?>
+            <div class="feed-card" data-report-id="<?php echo $r['id']; ?>">
+                <div class="meta">
+                    Posted by <strong><?php echo htmlspecialchars($r['username']); ?></strong>
+                    &nbsp;·&nbsp; <?php echo date('M d, Y g:i A', strtotime($r['created_at'])); ?>
+                    <?php if ($r['location']): ?>
+                        &nbsp;·&nbsp; 📍 <?php echo htmlspecialchars($r['location']); ?>
+                    <?php endif; ?>
+                </div>
+                <div class="feed-title"><?php echo htmlspecialchars($r['title']); ?></div>
+                <div style="margin:6px 0;">
+                    <span class="badge" style="background:<?php echo $r['severity_level'] === 'High' ? '#c0392b' : ($r['severity_level'] === 'Medium' ? '#e0a800' : '#28a745'); ?>; color:white;">
+                        <?php echo $r['pollution_type']; ?> - <?php echo $r['severity_level']; ?>
+                    </span>
+                </div>
+                <?php if ($r['description']): ?>
+                    <div class="feed-desc"><?php echo nl2br(htmlspecialchars($r['description'])); ?></div>
+                <?php endif; ?>
+                <?php if ($r['photo']): ?>
+                    <img src="uploads/<?php echo htmlspecialchars($r['photo']); ?>" alt="report photo">
+                <?php endif; ?>
+                <div style="margin-top:10px;">
+                    <button class="support-btn <?php echo $r['user_supported'] ? 'active' : ''; ?>" 
+                            onclick="toggleSupport(<?php echo $r['id']; ?>, this)">
+                        Support (<span class="support-count"><?php echo $r['support_count']; ?></span>)
+                    </button>
+                </div>
+            </div>
+            <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ===================== Tab: Forum ===================== -->
+    <div id="tab-forum" class="tab-content">
+        <div class="card" style="margin-bottom: 16px;">
+            <div class="card-header">Community Forum</div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="form-group">
+                        <label>Share your thoughts, tips, or concerns</label>
+                        <textarea name="content" rows="3" placeholder="Write something..." required></textarea>
+                    </div>
+                    <div style="text-align: right;">
+                        <button type="submit" name="post_forum" class="btn btn-primary">Post</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <?php if (empty($forum_posts)): ?>
+            <p class="text-muted">No posts yet. Be the first to share!</p>
+        <?php else: ?>
+        <?php foreach ($forum_posts as $p): ?>
+        <div class="forum-post">
+            <span class="poster"><?php echo htmlspecialchars($p['username']); ?></span>
+            <span class="post-time"><?php echo date('M d, Y g:i A', strtotime($p['created_at'])); ?></span>
+            <div class="post-body"><?php echo nl2br(htmlspecialchars($p['content'])); ?></div>
+        </div>
+        <?php endforeach; ?>
+        <?php endif; ?>
+    </div>
+
+</div>
+
+<script>
+// =============================================
+// Tab switching
+// =============================================
+function switchTab(name, btn) {
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    btn.classList.add('active');
+    if (name === 'map') initMap();
+}
+
+if (window.location.hash === '#forum') {
+    document.getElementById('forum-tab-btn').click();
+}
+
+// =============================================
+// AJAX Auto-refresh for Dashboard (Section 2 from PDF)
+// =============================================
+let refreshInterval;
+
+function startAutoRefresh() {
+    // Refresh every 30 seconds
+    refreshInterval = setInterval(() => {
+        if (document.getElementById('tab-dashboard').classList.contains('active')) {
+            refreshDashboardData();
+        }
+    }, 30000);
+}
+
+function refreshDashboardData() {
+    fetch('dashboard_data.php')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                // Update recent reports
+                updateRecentReports(data.recent_reports);
+                
+                // Update nearby incidents
+                updateNearbyIncidents(data.nearby_incidents);
+                
+                // Update notification count
+                updateNotificationBadge(data.unread_count);
+                
+                // Update timestamp
+                document.getElementById('update-time').textContent = 'just now';
+            }
+        })
+        .catch(err => console.error('Auto-refresh failed:', err));
+}
+
+function updateRecentReports(reports) {
+    const tbody = document.getElementById('recent-reports-body');
+    if (reports.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted" style="padding:20px;">No reports yet.</td></tr>';
+        return;
+    }
+    
+    tbody.innerHTML = reports.map(r => `
+        <tr>
+            <td>${escapeHtml(r.title)}</td>
+            <td>${escapeHtml(r.pollution_type)}</td>
+            <td><span style="color:${r.severity_level === 'High' ? '#c0392b' : (r.severity_level === 'Medium' ? '#e0a800' : '#28a745')}">${r.severity_level}</span></td>
+            <td><span class="badge badge-${r.status}">${r.status.replace('_', ' ')}</span></td>
+            <td>${new Date(r.created_at).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'})}</td>
+        </tr>
+    `).join('');
+}
+
+function updateNearbyIncidents(incidents) {
+    document.getElementById('nearby-count').textContent = incidents.length;
+    // Similar implementation for nearby incidents
+}
+
+function updateNotificationBadge(count) {
+    const bell = document.getElementById('notif-bell');
+    const existing = bell.querySelector('.notification-badge');
+    if (count > 0) {
+        if (existing) {
+            existing.textContent = count;
+        } else {
+            bell.innerHTML += `<span class="notification-badge">${count}</span>`;
+        }
+    } else {
+        if (existing) existing.remove();
+    }
+}
+
+// Start auto-refresh on page load
+window.addEventListener('load', startAutoRefresh);
+
+// =============================================
+// AJAX Auto-refresh for Community Feed (Section 4 from PDF)
+// =============================================
+let feedCountdown = 30;
+let feedRefreshTimer;
+let feedCountdownTimer;
+
+function startFeedAutoRefresh() {
+    feedRefreshTimer = setInterval(() => {
+        if (document.getElementById('tab-feed').classList.contains('active')) {
+            refreshCommunityFeed();
+        }
+    }, 30000);
+    
+    feedCountdownTimer = setInterval(() => {
+        feedCountdown--;
+        const countdownElem = document.getElementById('feed-countdown');
+        if (countdownElem) countdownElem.textContent = feedCountdown;
+        if (feedCountdown <= 0) feedCountdown = 30;
+    }, 1000);
+}
+
+function refreshCommunityFeed() {
+    fetch('community_feed_data.php')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                updateCommunityFeedDisplay(data.approved_reports);
+                const timeElem = document.getElementById('feed-update-time');
+                if (timeElem) timeElem.textContent = 'just now';
+                feedCountdown = 30;
+            }
+        })
+        .catch(err => console.error('Community Feed refresh failed:', err));
+}
+
+function updateCommunityFeedDisplay(reports) {
+    const container = document.getElementById('community-feed-container');
+    const existingIds = Array.from(container.querySelectorAll('.feed-card')).map(card => card.dataset.reportId);
+    
+    if (reports.length === 0) {
+        container.innerHTML = '<p class="text-muted">No approved reports yet.</p>';
+        return;
+    }
+    
+    let html = '';
+    reports.forEach(r => {
+        const isNew = !existingIds.includes(r.id.toString());
+        const severityBg = r.severity_level === 'High' ? '#c0392b' : (r.severity_level === 'Medium' ? '#e0a800' : '#28a745');
+        const photoHTML = r.photo ? `<img src="uploads/${escapeHtml(r.photo)}" alt="report photo">` : '';
+        const descHTML = r.description ? `<div class="feed-desc">${escapeHtml(r.description).replace(/\n/g, '<br>')}</div>` : '';
+        const locationHTML = r.location ? `&nbsp;·&nbsp; 📍 ${escapeHtml(r.location)}` : '';
+        
+        html += `
+        <div class="feed-card ${isNew ? 'new-report-flash' : ''}" data-report-id="${r.id}">
+            <div class="meta">
+                Posted by <strong>${escapeHtml(r.username)}</strong>
+                &nbsp;·&nbsp; ${new Date(r.created_at).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit'})}
+                ${locationHTML}
+            </div>
+            <div class="feed-title">${escapeHtml(r.title)}</div>
+            <div style="margin:6px 0;">
+                <span class="badge" style="background:${severityBg}; color:white;">
+                    ${escapeHtml(r.pollution_type)} - ${escapeHtml(r.severity_level)}
+                </span>
+            </div>
+            ${descHTML}
+            ${photoHTML}
+            <div style="margin-top:10px;">
+                <button class="support-btn ${r.user_supported ? 'active' : ''}" 
+                        onclick="toggleSupport(${r.id}, this)">
+                    👍 <span class="support-count">${r.support_count || 0}</span> Support
+                </button>
+            </div>
+        </div>`;
+    });
+    
+    container.innerHTML = html;
+}
+
+// Start Community Feed auto-refresh on load
+window.addEventListener('load', startFeedAutoRefresh);
+
+// =============================================
+// Notifications
+// =============================================
+function toggleNotifications() {
+    const dropdown = document.getElementById('notification-dropdown');
+    dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none';
+}
+
+function markRead(notifId) {
+    fetch('mark_read.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'notif_id=' + notifId
+    }).then(() => location.reload());
+}
+
+function markAllRead() {
+    fetch('mark_read.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'notif_id=0'
+    }).then(() => location.reload());
+}
+
+// Close notifications when clicking outside
+document.addEventListener('click', function(e) {
+    const dropdown = document.getElementById('notification-dropdown');
+    const bell = document.getElementById('notif-bell');
+    if (!dropdown.contains(e.target) && !bell.contains(e.target)) {
+        dropdown.style.display = 'none';
+    }
+});
+
+// =============================================
+// Support/Upvote System
+// =============================================
+// =============================================
+// Filter Functions: My Reports
+// =============================================
+function applyMyReportsFilters() {
+    const type = document.getElementById('my-filter-type').value;
+    const severity = document.getElementById('my-filter-severity').value;
+    const date = document.getElementById('my-filter-date').value;
+    const location = document.getElementById('my-filter-location').value;
+    
+    console.log('My Reports Filters:', {type, severity, date, location});
+    
+    const params = new URLSearchParams({
+        scope: 'my_reports',
+        per_page: 100,
+        page: 1
+    });
+    
+    if (type) params.append('type', type);
+    if (severity) params.append('severity', severity);
+    if (date) {
+        params.append('date_from', date);
+        params.append('date_to', date);
+    }
+    if (location) params.append('location', location);
+    
+    const url = 'search.php?' + params.toString();
+    console.log('Fetching:', url);
+    
+    fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            console.log('My Reports Response:', data);
+            if (data.success) {
+                renderMyReports(data.reports);
+            } else {
+                console.error('Error:', data.error);
+            }
+        })
+        .catch(err => console.error('Filter error:', err));
+}
+
+function clearMyReportsFilters() {
+    document.getElementById('my-filter-type').value = '';
+    document.getElementById('my-filter-severity').value = '';
+    document.getElementById('my-filter-date').value = '';
+    document.getElementById('my-filter-location').value = '';
+    
+    fetch('search.php?scope=my_reports&per_page=100&page=1')
+        .then(res => res.json())
+        .then(data => {
+            console.log('Clear filters response:', data);
+            if (data.success) {
+                renderMyReports(data.reports);
+            }
+        });
+}
+
+function renderMyReports(reports) {
+    const tbody = document.getElementById('my-reports-tbody');
+    
+    console.log('Rendering', reports.length, 'reports');
+    
+    if (reports.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted" style="padding:16px;">No reports found.</td></tr>';
+        return;
+    }
+    
+    let html = '';
+    reports.forEach(r => {
+        html += `
+        <tr>
+            <td>${escapeHtml(r.title)}</td>
+            <td>${r.pollution_type}</td>
+            <td>${r.severity_level}</td>
+            <td>${escapeHtml(r.location || '—')}</td>
+            <td><span class="badge badge-${r.status}">${r.status.replace(/_/g, ' ')}</span></td>
+            <td>${new Date(r.created_at).toLocaleDateString('en-US', {year: 'numeric', month: 'short', day: 'numeric'})}</td>
+        </tr>`;
+    });
+    
+    tbody.innerHTML = html;
+}
+
+// =============================================
+// Filter Functions: Community Feed
+// =============================================
+function applyFeedFilters() {
+    const type = document.getElementById('feed-filter-type').value;
+    const severity = document.getElementById('feed-filter-severity').value;
+    const date = document.getElementById('feed-filter-date').value;
+    const location = document.getElementById('feed-filter-location').value;
+    
+    console.log('Feed Filters:', {type, severity, date, location});
+    
+    const params = new URLSearchParams({
+        scope: 'community_feed',
+        per_page: 100,
+        page: 1
+    });
+    
+    if (type) params.append('type', type);
+    if (severity) params.append('severity', severity);
+    if (date) {
+        params.append('date_from', date);
+        params.append('date_to', date);
+    }
+    if (location) params.append('location', location);
+    
+    const url = 'search.php?' + params.toString();
+    console.log('Fetching:', url);
+    
+    fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            console.log('Feed Response:', data);
+            if (data.success) {
+                renderCommunityFeed(data.reports);
+            } else {
+                console.error('Error:', data.error);
+            }
+        })
+        .catch(err => console.error('Filter error:', err));
+}
+
+function clearFeedFilters() {
+    document.getElementById('feed-filter-type').value = '';
+    document.getElementById('feed-filter-severity').value = '';
+    document.getElementById('feed-filter-date').value = '';
+    document.getElementById('feed-filter-location').value = '';
+    
+    fetch('search.php?scope=community_feed&per_page=100&page=1')
+        .then(res => res.json())
+        .then(data => {
+            console.log('Clear feed filters response:', data);
+            if (data.success) {
+                renderCommunityFeed(data.reports);
+            }
+        });
+}
+
+function renderCommunityFeed(reports) {
+    const container = document.getElementById('community-feed-container');
+    
+    if (reports.length === 0) {
+        container.innerHTML = '<p class="text-muted">No reports found.</p>';
+        return;
+    }
+    
+    let html = '';
+    reports.forEach(r => {
+        const severityColor = r.severity_level === 'High' ? '#c0392b' : (r.severity_level === 'Medium' ? '#e0a800' : '#28a745');
+        const photoHTML = r.photo ? `<img src="uploads/${escapeHtml(r.photo)}" alt="report photo">` : '';
+        const descHTML = r.description ? `<div class="feed-desc">${escapeHtml(r.description).replace(/\n/g, '<br>')}</div>` : '';
+        const locationHTML = r.location ? `&nbsp;·&nbsp; 📍 ${escapeHtml(r.location)}` : '';
+        const supportActive = r.user_supported > 0 ? 'active' : '';
+        
+        html += `
+        <div class="feed-card" data-report-id="${r.id}">
+            <div class="meta">
+                Posted by <strong>${escapeHtml(r.username)}</strong>
+                &nbsp;·&nbsp; ${new Date(r.created_at).toLocaleString('en-US', {year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'})}
+                ${locationHTML}
+            </div>
+            <div class="feed-title">${escapeHtml(r.title)}</div>
+            <div style="margin:6px 0;">
+                <span class="badge" style="background:${severityColor}; color:white;">
+                    ${r.pollution_type} - ${r.severity_level}
+                </span>
+            </div>
+            ${descHTML}
+            ${photoHTML}
+            <div style="margin-top:10px;">
+                <button class="support-btn ${supportActive}" onclick="toggleSupport(${r.id}, this)">
+                    Support (<span class="support-count">${r.support_count}</span>)
+                </button>
+            </div>
+        </div>`;
+    });
+    
+    container.innerHTML = html;
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// =============================================
+// Support Toggle
+// =============================================
+function toggleSupport(reportId, btn) {
+    fetch('support.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'report_id=' + reportId
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.success) {
+            btn.querySelector('.support-count').textContent = data.support_count;
+            if (data.action === 'added') {
+                btn.classList.add('active');
+            } else {
+                btn.classList.remove('active');
+            }
+        }
+    });
+}
+
+// =============================================
+// GPS
+// =============================================
+function getLocation() {
+    const status = document.getElementById('gps-status');
+    if (!navigator.geolocation) {
+        status.textContent = "Geolocation not supported.";
+        return;
+    }
+    status.textContent = "Getting location...";
+    navigator.geolocation.getCurrentPosition(
+        pos => {
+            document.getElementById('lat-input').value = pos.coords.latitude;
+            document.getElementById('lng-input').value = pos.coords.longitude;
+            status.textContent = `✅ (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`;
+        },
+        () => { status.textContent = "Could not get location."; }
+    );
+}
+
+// =============================================
+// Leaflet Map
+// =============================================
+let mapInitialized = false;
+
+function initMap() {
+    if (mapInitialized) return;
+    mapInitialized = true;
+
+    const map = L.map('report-map').setView([16.4023, 120.5960], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    const reports = <?php
+        $map_data = array_map(function($r) {
+            return [
+                'title'    => $r['title'],
+                'username' => $r['username'],
+                'location' => $r['location'] ?? '',
+                'lat'      => $r['latitude'],
+                'lng'      => $r['longitude'],
+            ];
+        }, array_filter($approved_reports, fn($r) => $r['latitude'] && $r['longitude']));
+        echo json_encode(array_values($map_data));
+    ?>;
+
+    reports.forEach(r => {
+        L.marker([r.lat, r.lng]).addTo(map)
+         .bindPopup(`<strong>${r.title}</strong><br>By: ${r.username}<br>${r.location}`);
+    });
+}
+
+// =============================================
+// AQI Widget
+// =============================================
+function fetchAQI() {
+    document.getElementById('aqi-status').textContent = "Fetching...";
+    const fallbackLat = 16.4023, fallbackLng = 120.5960, fallbackCity = "Baguio City";
+
+    function loadAQI(lat, lng, city) {
+        const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lng}&current=us_aqi`;
+        fetch(url)
+            .then(res => res.json())
+            .then(data => {
+                const aqi = data.current?.us_aqi;
+                document.getElementById('aqi-city').textContent = city;
+                document.getElementById('aqi-num').textContent  = aqi ?? '—';
+
+                let color, status, advice;
+                if (aqi == null)      { color = '#aaa';     status = 'No data';                          advice = ''; }
+                else if (aqi <= 50)   { color = '#28a745';  status = '😊 Good';                          advice = 'Air quality is satisfactory.'; }
+                else if (aqi <= 100)  { color = '#e0a800';  status = '😐 Moderate';                      advice = 'Sensitive groups should limit outdoor exposure.'; }
+                else if (aqi <= 150)  { color = '#e67e22';  status = '😷 Unhealthy for Some';            advice = 'Children and elderly should reduce outdoor activity.'; }
+                else if (aqi <= 200)  { color = '#c0392b';  status = '⚠️ Unhealthy';                     advice = 'Everyone may experience effects. Wear a mask outdoors.'; }
+                else if (aqi <= 300)  { color = '#9b59b6';  status = '🚨 Very Unhealthy';                advice = 'Avoid prolonged outdoor exposure.'; }
+                else                  { color = '#7f0000';  status = '☠️ Hazardous';                     advice = 'Stay indoors. Health alert for everyone.'; }
+
+                const circle = document.getElementById('aqi-circle');
+                circle.style.borderColor = color;
+                circle.style.color = color;
+                document.getElementById('aqi-status').textContent = status;
+                document.getElementById('aqi-status').style.color = color;
+                document.getElementById('aqi-advice').textContent = advice;
+            })
+            .catch(() => {
+                document.getElementById('aqi-status').textContent = 'Could not load AQI data.';
+                document.getElementById('aqi-city').textContent = city;
+            });
+    }
+
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+            pos => loadAQI(pos.coords.latitude, pos.coords.longitude, "Your Location"),
+            ()  => loadAQI(fallbackLat, fallbackLng, fallbackCity)
+        );
+    } else {
+        loadAQI(fallbackLat, fallbackLng, fallbackCity);
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+fetchAQI();
+</script>
+</body>
+</html>
+ADMIN:
+admin@pollutionapp.com
+admin123
+
+USER:
+user1@email.com
+123456
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+redirectIfNotAdmin();
+
+header('Content-Type: application/json');
+
+// Dashboard stats
+$total = $conn->query("SELECT COUNT(*) FROM reports")->fetchColumn();
+$pending = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'pending'")->fetchColumn();
+$investigating = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'under_investigation'")->fetchColumn();
+$resolved = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'resolved'")->fetchColumn();
+
+// Recent reports (last 10)
+$stmt = $conn->prepare("
+    SELECT r.*, u.username
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.status = 'pending'
+    ORDER BY r.created_at DESC
+    LIMIT 10
+");
+$stmt->execute();
+$recent_reports = $stmt->fetchAll();
+
+echo json_encode([
+    'success' => true,
+    'stats' => [
+        'total' => (int)$total,
+        'pending' => (int)$pending,
+        'investigating' => (int)$investigating,
+        'resolved' => (int)$resolved
+    ],
+    'recent_reports' => $recent_reports,
+    'timestamp' => time()
+]);
+?>
+<?php
+require 'config.php';
+redirectIfNotLoggedIn();
+redirectIfNotAdmin();
+
+$admin_username = $_SESSION['username'];
+
+// Handle user deletion
+if (isset($_GET['delete_user'])) {
+    $user_id = (int) $_GET['delete_user'];
+    $admin_id = $_SESSION['user_id'];
+    
+    // Don't allow deleting yourself
+    if ($user_id === $admin_id) {
+        header("Location: adminDashboard.php?error=cannot_delete_self");
+        exit();
+    }
+    
+    // Check if user exists and is not admin
+    $check_stmt = $conn->prepare("SELECT role FROM users WHERE id = :id");
+    $check_stmt->execute([':id' => $user_id]);
+    $user = $check_stmt->fetch();
+    
+    if ($user && $user['role'] !== 'admin') {
+        // Log the deletion
+        $log_stmt = $conn->prepare("
+            INSERT INTO admin_logs (admin_id, action, notes)
+            VALUES (:admin_id, 'user_deleted', CONCAT('Deleted user ID: ', :user_id))
+        ");
+        $log_stmt->execute([':admin_id' => $admin_id, ':user_id' => $user_id]);
+        
+        // Delete user (CASCADE will delete related data)
+        $stmt = $conn->prepare("DELETE FROM users WHERE id = :id");
+        $stmt->execute([':id' => $user_id]);
+        
+        header("Location: adminDashboard.php?success=user_deleted");
+        exit();
+    } else {
+        header("Location: adminDashboard.php?error=cannot_delete_admin");
+        exit();
+    }
+}
+
+// Handle APPROVAL
+if (isset($_POST['approve_report'])) {
+    $report_id = (int) $_POST['report_id'];
+    $admin_id = $_SESSION['user_id'];
+    $approval_notes = isset($_POST['admin_notes']) ? trim($_POST['admin_notes']) : '';
+    
+    $old_stmt = $conn->prepare("SELECT status, user_id FROM reports WHERE id = :id");
+    $old_stmt->execute([':id' => $report_id]);
+    $report_info = $old_stmt->fetch();
+    
+    $upd_stmt = $conn->prepare("
+        UPDATE reports 
+        SET status = 'approved', is_verified = 1, verified_at = NOW(), verified_by = :aid, admin_notes = :notes
+        WHERE id = :id
+    ");
+    $upd_stmt->execute([':aid' => $admin_id, ':id' => $report_id, ':notes' => $approval_notes]);
+    
+    $log_stmt = $conn->prepare("
+        INSERT INTO admin_logs (admin_id, report_id, action, old_status, new_status, notes)
+        VALUES (:admin_id, :report_id, 'approved', :old_status, 'approved', :notes)
+    ");
+    $log_stmt->execute([
+        ':admin_id' => $admin_id,
+        ':report_id' => $report_id,
+        ':old_status' => $report_info['status'],
+        ':notes' => 'Report approved' . ($approval_notes ? ': ' . $approval_notes : '')
+    ]);
+    
+    $notif_stmt = $conn->prepare("
+        INSERT INTO notifications (user_id, report_id, type, title, message)
+        VALUES (:uid, :rid, 'admin_action', 'Report Approved', 'Your report has been verified and approved')
+    ");
+    $notif_stmt->execute([':uid' => $report_info['user_id'], ':rid' => $report_id]);
+    
+    header("Location: adminDashboard.php");
+    exit();
+}
+
+// Handle REJECTION
+if (isset($_POST['reject_report'])) {
+    $report_id = (int) $_POST['report_id'];
+    $admin_id = $_SESSION['user_id'];
+    $rejection_notes = isset($_POST['admin_notes']) ? trim($_POST['admin_notes']) : 'No reason provided';
+    
+    $old_stmt = $conn->prepare("SELECT status, user_id FROM reports WHERE id = :id");
+    $old_stmt->execute([':id' => $report_id]);
+    $report_info = $old_stmt->fetch();
+    
+    $upd_stmt = $conn->prepare("UPDATE reports SET status = 'rejected', admin_notes = :notes WHERE id = :id");
+    $upd_stmt->execute([':notes' => "REJECTED: " . $rejection_notes, ':id' => $report_id]);
+    
+    $log_stmt = $conn->prepare("
+        INSERT INTO admin_logs (admin_id, report_id, action, old_status, new_status, notes)
+        VALUES (:admin_id, :report_id, 'rejected', :old_status, 'rejected', :notes)
+    ");
+    $log_stmt->execute([
+        ':admin_id' => $admin_id,
+        ':report_id' => $report_id,
+        ':old_status' => $report_info['status'],
+        ':notes' => 'Rejected: ' . $rejection_notes
+    ]);
+    
+    $notif_stmt = $conn->prepare("
+        INSERT INTO notifications (user_id, report_id, type, title, message)
+        VALUES (:uid, :rid, 'admin_action', 'Report Rejected', :msg)
+    ");
+    $notif_stmt->execute([
+        ':uid' => $report_info['user_id'],
+        ':rid' => $report_id,
+        ':msg' => 'Your report was rejected. Reason: ' . $rejection_notes
+    ]);
+    
+    header("Location: adminDashboard.php");
+    exit();
+}
+
+// Handle status updates (workflow only)
+if (isset($_POST['update_status'])) {
+    $report_id = (int) $_POST['report_id'];
+    $new_status = trim($_POST['new_status']);
+    $admin_notes = isset($_POST['admin_notes']) ? trim($_POST['admin_notes']) : '';
+    $admin_id = $_SESSION['user_id'];
+    
+    $valid_statuses = ['pending', 'under_investigation', 'action_taken', 'resolved', 'approved', 'rejected'];
+    
+    if (in_array($new_status, $valid_statuses)) {
+        $old_stmt = $conn->prepare("SELECT status, user_id FROM reports WHERE id = :id");
+        $old_stmt->execute([':id' => $report_id]);
+        $report_info = $old_stmt->fetch();
+        $old_status = $report_info['status'];
+        
+        $stmt = $conn->prepare("UPDATE reports SET status = :status, admin_notes = :notes WHERE id = :id");
+        $stmt->execute([':status' => $new_status, ':notes' => $admin_notes, ':id' => $report_id]);
+        
+        $log_stmt = $conn->prepare("
+            INSERT INTO admin_logs (admin_id, report_id, action, old_status, new_status, notes)
+            VALUES (:admin_id, :report_id, 'status_updated', :old_status, :new_status, :notes)
+        ");
+        $log_stmt->execute([
+            ':admin_id' => $admin_id,
+            ':report_id' => $report_id,
+            ':old_status' => $old_status,
+            ':new_status' => $new_status,
+            ':notes' => $admin_notes
+        ]);
+        
+        $notif_stmt = $conn->prepare("
+            INSERT INTO notifications (user_id, report_id, type, title, message)
+            VALUES (:uid, :rid, 'status_update', 'Report Status Updated', CONCAT('Your report status changed to: ', :status))
+        ");
+        $notif_stmt->execute([
+            ':uid' => $report_info['user_id'],
+            ':rid' => $report_id,
+            ':status' => ucfirst(str_replace('_', ' ', $new_status))
+        ]);
+        
+        header("Location: adminDashboard.php");
+        exit();
+    }
+}
+
+// Handle delete
+if (isset($_GET['delete_report'])) {
+    $id = (int) $_GET['delete_report'];
+    $admin_id = $_SESSION['user_id'];
+    
+    $log_stmt = $conn->prepare("
+        INSERT INTO admin_logs (admin_id, report_id, action, notes)
+        VALUES (:admin_id, :report_id, 'deleted', 'Report deleted by admin')
+    ");
+    $log_stmt->execute([':admin_id' => $admin_id, ':report_id' => $id]);
+    
+    $stmt = $conn->prepare("DELETE FROM reports WHERE id = :id");
+    $stmt->execute([':id' => $id]);
+    header("Location: adminDashboard.php");
+    exit();
+}
+
+// Dashboard stats
+$totalUsers = $conn->query("SELECT COUNT(*) FROM users WHERE role = 'user'")->fetchColumn();
+$totalReports = $conn->query("SELECT COUNT(*) FROM reports")->fetchColumn();
+$pending = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'pending'")->fetchColumn();
+$investigating = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'under_investigation'")->fetchColumn();
+$action_taken = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'action_taken'")->fetchColumn();
+$resolved = $conn->query("SELECT COUNT(*) FROM reports WHERE status = 'resolved'")->fetchColumn();
+
+// LIVE FEED: Only PENDING reports
+$stmt = $conn->prepare("
+    SELECT r.*, u.username
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.status = 'pending'
+    ORDER BY r.created_at DESC
+    LIMIT 10
+");
+$stmt->execute();
+$recent_reports = $stmt->fetchAll();
+
+// ALL REPORTS: Only APPROVED and REJECTED reports
+$stmt = $conn->prepare("
+    SELECT r.*, u.username
+    FROM reports r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.status IN ('approved', 'rejected', 'under_investigation', 'action_taken', 'resolved')
+    ORDER BY r.created_at DESC
+");
+$stmt->execute();
+$reports = $stmt->fetchAll();
+
+$stmt = $conn->prepare("SELECT * FROM users ORDER BY role DESC, created_at DESC");
+$stmt->execute();
+$users = $stmt->fetchAll();
+
+$log_stmt = $conn->prepare("
+    SELECT al.*, u.username, r.title
+    FROM admin_logs al
+    LEFT JOIN users u ON al.admin_id = u.id
+    LEFT JOIN reports r ON al.report_id = r.id
+    ORDER BY al.created_at DESC
+    LIMIT 100
+");
+$log_stmt->execute();
+$activity_logs = $log_stmt->fetchAll();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard — AirWatch</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 1000; }
+        .modal-content { background: white; border-radius: 8px; width: 90%; max-width: 600px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-height: 85vh; overflow-y: auto; }
+        .modal-header { padding: 16px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h2 { margin: 0; font-size: 1.3rem; }
+        .modal-close { font-size: 28px; cursor: pointer; color: #999; line-height: 1; }
+        .modal-close:hover { color: #000; }
+        .modal-body { padding: 20px; }
+        
+        .new-report-flash {
+            animation: flashGreen 1s ease-in-out;
+        }
+        @keyframes flashGreen {
+            0%, 100% { background-color: transparent; }
+            50% { background-color: #d4edda; }
+        }
+        
+        .review-action-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 2px solid #eee;
+        }
+        
+        .review-action-buttons button {
+            flex: 1;
+            max-width: 180px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <div class="topnav">
+        <div class="brand">🌿 AirWatch — Admin Panel</div>
+        <div class="user-info">
+            Logged in as <strong><?php echo htmlspecialchars($admin_username); ?></strong>
+            &nbsp;|&nbsp;
+            <a href="logout.php" class="btn btn-danger btn-sm">Logout</a>
+        </div>
+    </div>
+
+    <!-- Success/Error Messages -->
+    <?php if (isset($_GET['success'])): ?>
+        <div class="card" style="background: #d4edda; border: 1px solid #c3e6cb; color: #155724; margin-bottom: 16px;">
+            <div class="card-body">
+                <?php if ($_GET['success'] === 'user_deleted'): ?>
+                    ✓ User deleted successfully.
+                <?php endif; ?>
+            </div>
+        </div>
+    <?php endif; ?>
+    
+    <?php if (isset($_GET['error'])): ?>
+        <div class="card" style="background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; margin-bottom: 16px;">
+            <div class="card-body">
+                <?php if ($_GET['error'] === 'cannot_delete_self'): ?>
+                    ✗ You cannot delete your own account.
+                <?php elseif ($_GET['error'] === 'cannot_delete_admin'): ?>
+                    ✗ Cannot delete admin users.
+                <?php else: ?>
+                    ✗ An error occurred.
+                <?php endif; ?>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <!-- Welcome Message -->
+    <div class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:white; border:none; margin-bottom:20px;">
+        <div class="card-body">
+            <h2 style="margin:0 0 8px 0; color:white;">Admin Dashboard</h2>
+            <p style="margin:0; opacity:0.9;">Monitor incoming reports, validate submissions, and manage pollution data in real-time.</p>
+        </div>
+    </div>
+
+    <!-- Stats (AJAX auto-refresh) -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="num" id="stat-total"><?php echo $totalReports; ?></div>
+            <div class="label">Total Reports</div>
+        </div>
+        <div class="stat-card">
+            <div class="num" style="color:#e0a800;" id="stat-pending"><?php echo $pending; ?></div>
+            <div class="label">Pending Review</div>
+        </div>
+        <div class="stat-card">
+            <div class="num" style="color:#0066cc;" id="stat-investigating"><?php echo $investigating; ?></div>
+            <div class="label">Investigating</div>
+        </div>
+        <div class="stat-card">
+            <div class="num" style="color:#28a745;" id="stat-resolved"><?php echo $resolved; ?></div>
+            <div class="label">Resolved</div>
+        </div>
+    </div>
+
+    <!-- Live Feed of Recent Reports (PENDING ONLY) -->
+    <div class="card" style="margin-bottom:20px;">
+        <div class="card-header">
+            LIVE: Recent Report Submissions (Pending)
+            <span style="float:right; font-size:0.8rem; font-weight:normal;">
+                Auto-refresh: <span id="refresh-countdown">30</span>s | 
+                Last update: <span id="last-update-time">just now</span>
+            </span>
+        </div>
+        <div class="card-body" style="padding:0;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Title</th>
+                        <th>Type</th>
+                        <th>Severity</th>
+                        <th>Submitted By</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="live-reports-body">
+                    <?php if (empty($recent_reports)): ?>
+                    <tr><td colspan="6" class="text-center text-muted">No pending reports.</td></tr>
+                    <?php else: ?>
+                    <?php foreach ($recent_reports as $r): ?>
+                    <tr data-report-id="<?php echo $r['id']; ?>">
+                        <td><?php echo date('g:i A', strtotime($r['created_at'])); ?></td>
+                        <td><?php echo htmlspecialchars($r['title']); ?></td>
+                        <td><?php echo $r['pollution_type']; ?></td>
+                        <td>
+                            <span style="color:<?php echo $r['severity_level'] === 'High' ? '#c0392b' : ($r['severity_level'] === 'Medium' ? '#e0a800' : '#28a745'); ?>">
+                                <?php echo $r['severity_level']; ?>
+                            </span>
+                        </td>
+                        <td><?php echo htmlspecialchars($r['username']); ?></td>
+                        <td>
+                            <button class="btn btn-sm btn-primary" onclick='openReviewModal(<?php echo $r["id"]; ?>, <?php echo json_encode($r); ?>)'>Review</button>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('reports', this)">All Reports</button>
+        <button class="tab-btn" onclick="switchTab('users', this)">Users</button>
+        <button class="tab-btn" onclick="switchTab('logs', this)">Activity Logs</button>
+        <button class="tab-btn" onclick="switchTab('analytics', this)">Analytics</button>
+    </div>
+
+    <!-- Reports Tab (APPROVED/REJECTED ONLY) -->
+    <div id="tab-reports" class="tab-content active">
+        <div class="card">
+            <div class="card-header">All Pollution Reports (Approved/Rejected)</div>
+            <div class="card-body">
+                <!-- Filter Form -->
+                <div style="background: #f8f9fa; padding: 16px; border-radius: 6px; margin-bottom: 16px;">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Pollution Type</label>
+                            <select id="filter-type" class="form-control" style="width: 100%;">
+                                <option value="">All Types</option>
+                                <option value="Air">Air</option>
+                                <option value="Water">Water</option>
+                                <option value="Noise">Noise</option>
+                                <option value="Waste">Waste</option>
+                                <option value="Chemical">Chemical</option>
+                                <option value="Soil">Soil</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Severity</label>
+                            <select id="filter-severity" class="form-control" style="width: 100%;">
+                                <option value="">All Severities</option>
+                                <option value="Low">Low</option>
+                                <option value="Medium">Medium</option>
+                                <option value="High">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Date</label>
+                            <input type="date" id="filter-date" class="form-control" style="width: 100%;">
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.85rem; margin-bottom: 4px; color: #555;">Location</label>
+                            <input type="text" id="filter-location" class="form-control" placeholder="Search location..." style="width: 100%;">
+                        </div>
+                    </div>
+                    <div style="margin-top: 12px; display: flex; gap: 8px;">
+                        <button onclick="applyAdminFilters()" class="btn btn-primary btn-sm">Apply Filters</button>
+                        <button onclick="clearAdminFilters()" class="btn btn-secondary btn-sm">Clear</button>
+                    </div>
+                </div>
+
+                <!-- Reports Table -->
+                <div id="admin-reports-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Photo</th>
+                                <th>Title</th>
+                                <th>Type</th>
+                                <th>Severity</th>
+                                <th>Submitted By</th>
+                                <th>Location</th>
+                                <th>Date</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-reports-tbody">
+                            <?php if (empty($reports)): ?>
+                            <tr><td colspan="9" class="text-center text-muted">No processed reports yet.</td></tr>
+                            <?php else: ?>
+                            <?php 
+                            $page_reports = array_slice($reports, 0, 5);
+                            foreach ($page_reports as $r): 
+                            ?>
+                            <tr>
+                                <td>
+                                    <?php if ($r['photo']): ?>
+                                        <img src="uploads/<?php echo htmlspecialchars($r['photo']); ?>" class="photo-thumb" alt="photo">
+                                    <?php else: ?>
+                                        <span class="text-muted">None</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($r['title']); ?></td>
+                                <td><?php echo $r['pollution_type']; ?></td>
+                                <td><?php echo $r['severity_level']; ?></td>
+                                <td><?php echo htmlspecialchars($r['username']); ?></td>
+                                <td><?php echo htmlspecialchars($r['location'] ?? '—'); ?></td>
+                                <td><?php echo date('M d, Y', strtotime($r['created_at'])); ?></td>
+                                <td>
+                                    <span class="badge badge-<?php echo $r['status']; ?>">
+                                        <?php echo ucfirst(str_replace('_', ' ', $r['status'])); ?>
+                                    </span>
+                                </td>
+                                <td>
+                                    <button class="btn btn-sm btn-primary" onclick='openViewModal(<?php echo json_encode($r); ?>)'>View</button>
+                                    <button class="btn btn-sm btn-warning" onclick='openStatusModal(<?php echo $r["id"]; ?>, "<?php echo $r["status"]; ?>", "<?php echo htmlspecialchars($r["admin_notes"] ?? ""); ?>")'>Update</button>
+                                    <a href="adminDashboard.php?delete_report=<?php echo $r['id']; ?>" class="btn btn-sm btn-danger" onclick="return confirm('Delete permanently?');">Delete</a>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+
+                    <!-- Pagination -->
+                    <div id="admin-pagination" style="margin-top: 16px; text-align: center;">
+                        <?php 
+                        $total_reports = count($reports);
+                        $total_pages = ceil($total_reports / 5);
+                        if ($total_pages > 1):
+                        ?>
+                        <div style="display: inline-flex; gap: 4px;">
+                            <?php for ($i = 1; $i <= $total_pages; $i++): ?>
+                                <button class="btn btn-sm <?php echo $i === 1 ? 'btn-primary' : 'btn-secondary'; ?>" 
+                                        onclick="goToAdminPage(<?php echo $i; ?>)"
+                                        id="admin-page-<?php echo $i; ?>">
+                                    <?php echo $i; ?>
+                                </button>
+                            <?php endfor; ?>
+                        </div>
+                        <div style="margin-top: 8px; font-size: 0.85rem; color: #666;">
+                            Page <span id="admin-current-page">1</span> of <span id="admin-total-pages"><?php echo $total_pages; ?></span>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Users Tab -->
+    <div id="tab-users" class="tab-content">
+        <div class="card">
+            <div class="card-header">Registered Users (<?php echo count($users); ?>)</div>
+            <div class="card-body" style="padding:0;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Username</th>
+                            <th>Email</th>
+                            <th>Role</th>
+                            <th>Registered</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (empty($users)): ?>
+                        <tr><td colspan="6" class="text-center text-muted">No users yet.</td></tr>
+                        <?php else: ?>
+                        <?php foreach ($users as $u): ?>
+                        <tr>
+                            <td><?php echo $u['id']; ?></td>
+                            <td><?php echo htmlspecialchars($u['username']); ?></td>
+                            <td><?php echo htmlspecialchars($u['email']); ?></td>
+                            <td>
+                                <span class="badge" style="background: <?php echo $u['role'] === 'admin' ? '#667eea' : '#28a745'; ?>; color: white;">
+                                    <?php echo ucfirst($u['role']); ?>
+                                </span>
+                            </td>
+                            <td><?php echo date('M d, Y', strtotime($u['created_at'])); ?></td>
+                            <td>
+                                <?php if ($u['role'] !== 'admin'): ?>
+                                    <a href="adminDashboard.php?delete_user=<?php echo $u['id']; ?>" 
+                                       class="btn btn-sm btn-danger" 
+                                       onclick="return confirm('Delete user <?php echo htmlspecialchars($u['username']); ?>? This will also delete all their reports and data.');">
+                                        Delete
+                                    </a>
+                                <?php else: ?>
+                                    <span class="text-muted" style="font-size: 0.85rem;">Protected</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Activity Logs Tab -->
+    <div id="tab-logs" class="tab-content">
+        <div class="card">
+            <div class="card-header">Admin Activity Logs</div>
+            <div class="card-body" style="padding:0;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Admin</th>
+                            <th>Action</th>
+                            <th>Report</th>
+                            <th>Status Change</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($activity_logs as $log): ?>
+                        <tr>
+                            <td><?php echo date('M d, g:i A', strtotime($log['created_at'])); ?></td>
+                            <td><?php echo htmlspecialchars($log['username']); ?></td>
+                            <td><?php echo str_replace('_', ' ', $log['action']); ?></td>
+                            <td><?php echo htmlspecialchars($log['title'] ?? '—'); ?></td>
+                            <td>
+                                <?php if ($log['old_status'] && $log['new_status']): ?>
+                                    <?php echo $log['old_status']; ?> → <?php echo $log['new_status']; ?>
+                                <?php else: ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo htmlspecialchars($log['notes'] ?? '—'); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Analytics Tab -->
+    <div id="tab-analytics" class="tab-content">
+        <h3 style="margin-bottom:16px;">Reports Analytics</h3>
+        
+        <div class="analytics-grid">
+            <?php
+            // By type
+            $type_stmt = $conn->query("SELECT pollution_type, COUNT(*) as count FROM reports GROUP BY pollution_type");
+            $by_type = $type_stmt->fetchAll();
+            ?>
+            <div class="analytics-card">
+                <h4>By Pollution Type</h4>
+                <?php foreach ($by_type as $t): ?>
+                    <div style="margin:8px 0;"><?php echo $t['pollution_type']; ?>: <strong><?php echo $t['count']; ?></strong></div>
+                <?php endforeach; ?>
+            </div>
+
+            <?php
+            // By severity
+            $sev_stmt = $conn->query("SELECT severity_level, COUNT(*) as count FROM reports GROUP BY severity_level");
+            $by_severity = $sev_stmt->fetchAll();
+            ?>
+            <div class="analytics-card">
+                <h4>By Severity</h4>
+                <?php foreach ($by_severity as $s): ?>
+                    <div style="margin:8px 0;"><?php echo $s['severity_level']; ?>: <strong><?php echo $s['count']; ?></strong></div>
+                <?php endforeach; ?>
+            </div>
+
+            <div class="analytics-card">
+                <h4>Export Data</h4>
+                <a href="export_csv.php" class="btn btn-primary">Download CSV</a>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<!-- Status Update Modal (For all processed reports) -->
+<div id="status-modal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Update Report Status</h2>
+            <span class="modal-close" onclick="closeStatusModal()">&times;</span>
+        </div>
+        <div class="modal-body">
+            <form method="POST">
+                <input type="hidden" name="report_id" id="report_id">
+                <div class="form-group">
+                    <label>Status</label>
+                    <select name="new_status" id="new_status" required>
+                        <option value="pending">Pending</option>
+                        <option value="approved">Approved</option>
+                        <option value="rejected">Rejected</option>
+                        <option value="under_investigation">Under Investigation</option>
+                        <option value="action_taken">Action Taken</option>
+                        <option value="resolved">Resolved</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Admin Notes</label>
+                    <textarea name="admin_notes" id="admin_notes" rows="3"></textarea>
+                </div>
+                <div style="text-align:right;">
+                    <button type="button" class="btn btn-secondary" onclick="closeStatusModal()">Cancel</button>
+                    <button type="submit" name="update_status" class="btn btn-primary">Update</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Review Modal (Live Feed - With Remarks and Approve/Reject) -->
+<div id="review-modal" class="modal">
+    <div class="modal-content" style="max-width: 700px;">
+        <div class="modal-header">
+            <h2>Review Report</h2>
+            <span class="modal-close" onclick="closeReviewModal()">&times;</span>
+        </div>
+        <div class="modal-body" id="review-content">
+            <!-- Content filled by JS -->
+        </div>
+        <div style="padding: 0 20px;">
+            <div class="form-group">
+                <label>Remarks / Additional Notes</label>
+                <textarea id="review-notes" rows="3" placeholder="Add your remarks here..." style="width: 100%; padding: 8px; border: 1px solid #bbb; border-radius: 4px;"></textarea>
+            </div>
+        </div>
+        <div class="review-action-buttons" style="padding: 0 20px 20px;">
+            <button onclick="approveReport()" class="btn btn-success">Approve</button>
+            <button onclick="rejectReport()" class="btn btn-danger">Reject</button>
+        </div>
+    </div>
+</div>
+
+<!-- View Modal (All Reports Tab - Read Only) -->
+<div id="view-modal" class="modal">
+    <div class="modal-content" style="max-width: 700px;">
+        <div class="modal-header">
+            <h2>Report Details</h2>
+            <span class="modal-close" onclick="closeViewModal()">&times;</span>
+        </div>
+        <div class="modal-body" id="view-content">
+            <!-- Content filled by JS -->
+        </div>
+    </div>
+</div>
+
+<script>
+// =============================================
+// AJAX Live Updates (Only Pending Reports)
+// =============================================
+let countdown = 30;
+let refreshTimer;
+let countdownTimer;
+
+function startAutoRefresh() {
+    refreshTimer = setInterval(refreshDashboard, 30000);
+    countdownTimer = setInterval(() => {
+        countdown--;
+        document.getElementById('refresh-countdown').textContent = countdown;
+        if (countdown <= 0) countdown = 30;
+    }, 1000);
+}
+
+function refreshDashboard() {
+    fetch('admin_dashboard_data.php')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                document.getElementById('stat-total').textContent = data.stats.total;
+                document.getElementById('stat-pending').textContent = data.stats.pending;
+                document.getElementById('stat-investigating').textContent = data.stats.investigating;
+                document.getElementById('stat-resolved').textContent = data.stats.resolved;
+                updateLiveReports(data.recent_reports);
+                document.getElementById('last-update-time').textContent = 'just now';
+                countdown = 30;
+            }
+        })
+        .catch(err => console.error('Auto-refresh failed:', err));
+}
+
+function updateLiveReports(reports) {
+    const tbody = document.getElementById('live-reports-body');
+    
+    if (reports.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No pending reports.</td></tr>';
+        return;
+    }
+    
+    const existingIds = Array.from(tbody.querySelectorAll('tr')).map(tr => tr.dataset.reportId);
+    
+    let html = '';
+    reports.forEach(r => {
+        const isNew = !existingIds.includes(r.id.toString());
+        const severityColor = r.severity_level === 'High' ? '#c0392b' : (r.severity_level === 'Medium' ? '#e0a800' : '#28a745');
+        
+        html += `
+        <tr data-report-id="${r.id}" class="${isNew ? 'new-report-flash' : ''}">
+            <td>${new Date(r.created_at).toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'})}</td>
+            <td>${escapeHtml(r.title)}</td>
+            <td>${r.pollution_type}</td>
+            <td><span style="color:${severityColor}">${r.severity_level}</span></td>
+            <td>${escapeHtml(r.username)}</td>
+            <td><button class="btn btn-sm btn-primary" onclick='openReviewModal(${r.id}, ${JSON.stringify(r)})'>Review</button></td>
+        </tr>`;
+    });
+    
+    tbody.innerHTML = html;
+}
+
+window.addEventListener('load', startAutoRefresh);
+
+// =============================================
+// Admin Filter & Pagination
+// =============================================
+let adminCurrentPage = 1;
+let adminAllReports = [];
+
+// Store all reports on page load
+<?php if (!empty($reports)): ?>
+adminAllReports = <?php echo json_encode($reports); ?>;
+<?php endif; ?>
+
+function applyAdminFilters() {
+    const type = document.getElementById('filter-type').value;
+    const severity = document.getElementById('filter-severity').value;
+    const date = document.getElementById('filter-date').value;
+    const location = document.getElementById('filter-location').value;
+    
+    console.log('Admin Filters:', {type, severity, date, location});
+    
+    const params = new URLSearchParams({
+        scope: 'admin_all',
+        per_page: 5,
+        page: 1
+    });
+    
+    if (type) params.append('type', type);
+    if (severity) params.append('severity', severity);
+    if (date) {
+        params.append('date_from', date);
+        params.append('date_to', date);
+    }
+    if (location) params.append('location', location);
+    
+    const url = 'search.php?' + params.toString();
+    console.log('Fetching:', url);
+    
+    fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            console.log('Admin Response:', data);
+            if (data.success) {
+                adminAllReports = data.reports;
+                adminCurrentPage = 1;
+                renderAdminReports();
+                renderAdminPagination(data.pagination.total_pages);
+            } else {
+                console.error('Error:', data.error);
+            }
+        })
+        .catch(err => console.error('Filter error:', err));
+}
+
+function clearAdminFilters() {
+    document.getElementById('filter-type').value = '';
+    document.getElementById('filter-severity').value = '';
+    document.getElementById('filter-date').value = '';
+    document.getElementById('filter-location').value = '';
+    
+    fetch('search.php?scope=admin_all&per_page=100&page=1')
+        .then(res => res.json())
+        .then(data => {
+            console.log('Clear admin filters response:', data);
+            if (data.success) {
+                adminAllReports = data.reports;
+                adminCurrentPage = 1;
+                renderAdminReports();
+                renderAdminPagination(Math.ceil(adminAllReports.length / 5));
+            }
+        });
+}
+
+function renderAdminReports() {
+    const tbody = document.getElementById('admin-reports-tbody');
+    const start = (adminCurrentPage - 1) * 5;
+    const end = start + 5;
+    const pageReports = adminAllReports.slice(start, end);
+    
+    if (pageReports.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">No reports found.</td></tr>';
+        return;
+    }
+    
+    let html = '';
+    pageReports.forEach(r => {
+        const photoHTML = r.photo 
+            ? `<img src="uploads/${escapeHtml(r.photo)}" class="photo-thumb" alt="photo">`
+            : '<span class="text-muted">None</span>';
+        
+        html += `
+        <tr>
+            <td>${photoHTML}</td>
+            <td>${escapeHtml(r.title)}</td>
+            <td>${r.pollution_type}</td>
+            <td>${r.severity_level}</td>
+            <td>${escapeHtml(r.username)}</td>
+            <td>${escapeHtml(r.location || '—')}</td>
+            <td>${new Date(r.created_at).toLocaleDateString('en-US', {year: 'numeric', month: 'short', day: 'numeric'})}</td>
+            <td><span class="badge badge-${r.status}">${r.status.replace(/_/g, ' ')}</span></td>
+            <td>
+                <button class="btn btn-sm btn-primary" onclick='openViewModal(${JSON.stringify(r)})'>View</button>
+                <button class="btn btn-sm btn-warning" onclick='openStatusModal(${r.id}, "${r.status}", "${escapeHtml(r.admin_notes || '')}")'>Update</button>
+                <a href="adminDashboard.php?delete_report=${r.id}" class="btn btn-sm btn-danger" onclick="return confirm('Delete permanently?');">Delete</a>
+            </td>
+        </tr>`;
+    });
+    
+    tbody.innerHTML = html;
+    document.getElementById('admin-current-page').textContent = adminCurrentPage;
+}
+
+function renderAdminPagination(totalPages) {
+    const container = document.getElementById('admin-pagination');
+    
+    if (totalPages <= 1) {
+        container.innerHTML = '';
+        return;
+    }
+    
+    let html = '<div style="display: inline-flex; gap: 4px;">';
+    for (let i = 1; i <= totalPages; i++) {
+        const btnClass = i === adminCurrentPage ? 'btn-primary' : 'btn-secondary';
+        html += `<button class="btn btn-sm ${btnClass}" onclick="goToAdminPage(${i})" id="admin-page-${i}">${i}</button>`;
+    }
+    html += '</div>';
+    html += `<div style="margin-top: 8px; font-size: 0.85rem; color: #666;">Page <span id="admin-current-page">${adminCurrentPage}</span> of <span id="admin-total-pages">${totalPages}</span></div>`;
+    
+    container.innerHTML = html;
+}
+
+function goToAdminPage(page) {
+    adminCurrentPage = page;
+    renderAdminReports();
+    
+    // Update button styles
+    const totalPages = Math.ceil(adminAllReports.length / 5);
+    for (let i = 1; i <= totalPages; i++) {
+        const btn = document.getElementById('admin-page-' + i);
+        if (btn) {
+            btn.className = i === page ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-secondary';
+        }
+    }
+    
+    document.getElementById('admin-current-page').textContent = page;
+}
+
+// =============================================
+// Tab Switching
+// =============================================
+function switchTab(name, btn) {
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    btn.classList.add('active');
+}
+
+// =============================================
+// Modal Functions
+// =============================================
+let currentReportId = null;
+
+function openStatusModal(reportId, currentStatus, adminNotes) {
+    document.getElementById('report_id').value = reportId;
+    document.getElementById('new_status').value = currentStatus;
+    document.getElementById('admin_notes').value = adminNotes;
+    document.getElementById('status-modal').style.display = 'flex';
+}
+
+function closeStatusModal() {
+    document.getElementById('status-modal').style.display = 'none';
+}
+
+// Review Modal (Live Feed)
+function openReviewModal(reportId, reportData) {
+    currentReportId = reportId;
+    const modal = document.getElementById('review-modal');
+    const content = document.getElementById('review-content');
+    
+    const severityColor = reportData.severity_level === 'High' ? '#c0392b' : (reportData.severity_level === 'Medium' ? '#e0a800' : '#28a745');
+    
+    let photoHTML = reportData.photo ? `<div style="margin: 12px 0;"><img src="uploads/${escapeHtml(reportData.photo)}" style="max-width: 100%; max-height: 300px; border-radius: 6px;"></div>` : '';
+    let descHTML = reportData.description ? `<div style="margin: 12px 0;"><strong>Description:</strong><p>${escapeHtml(reportData.description).replace(/\n/g, '<br>')}</p></div>` : '';
+    
+    content.innerHTML = `
+        <div style="border-bottom: 1px solid #ddd; padding-bottom: 12px; margin-bottom: 12px;">
+            <h3 style="margin: 0 0 8px 0;">${escapeHtml(reportData.title)}</h3>
+            <div style="color: #666; font-size: 0.9rem;">
+                <div>📅 ${new Date(reportData.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
+                <div>👤 By: <strong>${escapeHtml(reportData.username)}</strong></div>
+            </div>
+        </div>
+        
+        <div style="margin-bottom: 12px;">
+            <span style="display: inline-block; margin-right: 12px;"><strong>Type:</strong> ${escapeHtml(reportData.pollution_type)}</span>
+            <span style="display: inline-block; color:${severityColor};"><strong>Severity:</strong> ${escapeHtml(reportData.severity_level)}</span>
+        </div>
+        
+        <div style="margin-bottom: 12px;">
+            <strong>📍 Location:</strong> ${escapeHtml(reportData.location || 'Not specified')}
+        </div>
+        
+        ${photoHTML}
+        ${descHTML}
+    `;
+    
+    document.getElementById('review-notes').value = '';
+    modal.style.display = 'flex';
+}
+
+function closeReviewModal() {
+    document.getElementById('review-modal').style.display = 'none';
+    currentReportId = null;
+}
+
+// Approve Report
+function approveReport() {
+    if (!currentReportId) return;
+    
+    const notes = document.getElementById('review-notes').value.trim();
+    
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.innerHTML = `
+        <input type="hidden" name="report_id" value="${currentReportId}">
+        <input type="hidden" name="admin_notes" value="${notes}">
+        <input type="hidden" name="approve_report" value="1">
+    `;
+    document.body.appendChild(form);
+    form.submit();
+}
+
+// Reject Report
+function rejectReport() {
+    if (!currentReportId) return;
+    
+    const notes = document.getElementById('review-notes').value.trim();
+    
+    if (!notes) {
+        alert('Please provide a reason for rejection in the remarks field.');
+        return;
+    }
+    
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.innerHTML = `
+        <input type="hidden" name="report_id" value="${currentReportId}">
+        <input type="hidden" name="admin_notes" value="${notes}">
+        <input type="hidden" name="reject_report" value="1">
+    `;
+    document.body.appendChild(form);
+    form.submit();
+}
+
+// View Modal (All Reports Tab - Read Only)
+function openViewModal(reportData) {
+    const modal = document.getElementById('view-modal');
+    const content = document.getElementById('view-content');
+    
+    const severityColor = reportData.severity_level === 'High' ? '#c0392b' : (reportData.severity_level === 'Medium' ? '#e0a800' : '#28a745');
+    
+    let photoHTML = reportData.photo ? `<div style="margin: 12px 0;"><img src="uploads/${escapeHtml(reportData.photo)}" style="max-width: 100%; max-height: 300px; border-radius: 6px;"></div>` : '';
+    let descHTML = reportData.description ? `<div style="margin: 12px 0;"><strong>Description:</strong><p>${escapeHtml(reportData.description).replace(/\n/g, '<br>')}</p></div>` : '';
+    
+    content.innerHTML = `
+        <div style="border-bottom: 1px solid #ddd; padding-bottom: 12px; margin-bottom: 12px;">
+            <h3 style="margin: 0 0 8px 0;">${escapeHtml(reportData.title)}</h3>
+            <div style="color: #666; font-size: 0.9rem;">
+                <div>📅 ${new Date(reportData.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
+                <div>👤 By: <strong>${escapeHtml(reportData.username)}</strong></div>
+            </div>
+        </div>
+        
+        <div style="margin-bottom: 12px;">
+            <span style="display: inline-block; margin-right: 12px;"><strong>Type:</strong> ${escapeHtml(reportData.pollution_type)}</span>
+            <span style="display: inline-block; color:${severityColor};"><strong>Severity:</strong> ${escapeHtml(reportData.severity_level)}</span>
+        </div>
+        
+        <div style="margin-bottom: 12px;">
+            <strong>📍 Location:</strong> ${escapeHtml(reportData.location || 'Not specified')}
+        </div>
+        
+        <div style="margin-bottom: 12px;">
+            <strong>Status:</strong> <span class="badge badge-${reportData.status}">${reportData.status.replace(/_/g, ' ')}</span>
+        </div>
+        
+        ${photoHTML}
+        ${descHTML}
+        
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid #ddd;">
+            <strong>📝 Admin Notes:</strong>
+            <p>${reportData.admin_notes ? escapeHtml(reportData.admin_notes).replace(/\n/g, '<br>') : '<em style="color: #999;">None yet</em>'}</p>
+        </div>
+    `;
+    
+    modal.style.display = 'flex';
+}
+
+function closeViewModal() {
+    document.getElementById('view-modal').style.display = 'none';
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+window.onclick = function(event) {
+    if (event.target.classList.contains('modal')) {
+        event.target.style.display = 'none';
+    }
+}
+</script>
+</body>
+</html>
